@@ -53,12 +53,13 @@ async fn handle(State(server): State<Server>, request: Request) -> Response {
         .and_then(|s| s.strip_prefix("Basic "))
         .and_then(|s| STANDARD.decode(s).ok())
         .and_then(|b| String::from_utf8(b).ok());
-    let Some((device, token)) = auth.as_deref().and_then(|s| s.split_once(':')) else {
-        return unauthorized();
-    };
-    if !server.bridge.authenticate(device, token) {
+    let credentials = auth.as_deref().and_then(|s| s.split_once(':'));
+    if request.headers().contains_key(header::AUTHORIZATION)
+        && !credentials.is_some_and(|(device, token)| server.bridge.authenticate(device, token))
+    {
         return unauthorized();
     }
+    let device = credentials.map(|(device, _)| device.to_string());
     if request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -71,8 +72,10 @@ async fn handle(State(server): State<Server>, request: Request) -> Response {
     let Ok(permit) = server.uploads.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let device = device.to_string();
     let path = request.uri().path().to_string();
+    if device.is_none() && path.split('/').count() != 4 {
+        return unauthorized();
+    }
     let host = request
         .headers()
         .get(header::HOST)
@@ -84,20 +87,38 @@ async fn handle(State(server): State<Server>, request: Request) -> Response {
         })
         .unwrap_or("localhost")
         .to_string();
+    let limit = if device.is_some() {
+        MAX_PDF + MAX_ATTRIBUTE_BYTES + 8
+    } else {
+        MAX_ATTRIBUTE_BYTES + 8
+    };
+    let timeout = if device.is_some() { 300 } else { 10 };
     let body = match tokio::time::timeout(
-        Duration::from_secs(300),
-        to_bytes(request.into_body(), MAX_PDF + MAX_ATTRIBUTE_BYTES + 8),
+        Duration::from_secs(timeout),
+        to_bytes(request.into_body(), limit),
     )
     .await
     {
         Ok(Ok(body)) => body,
+        Ok(Err(_)) if device.is_none() => return unauthorized(),
         Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
+    if device.is_none()
+        && !matches!(parse(&body), Ok(message) if message.code == GET_PRINTER_ATTRIBUTES && message.document.is_empty())
+    {
+        return unauthorized();
+    }
     let bridge = server.bridge;
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        dispatch(&bridge, &device, &host, &path, &body)
+        dispatch(
+            &bridge,
+            device.as_deref().unwrap_or(""),
+            &host,
+            &path,
+            &body,
+        )
     })
     .await
     {
@@ -113,7 +134,50 @@ fn reply(message: &Message<'_>, code: u16, extra: Vec<Group>, detail: &str) -> V
     }
     let mut groups = vec![op];
     groups.extend(extra);
-    encode((1, 1), code, message.request_id, &groups, &[]).expect("bounded response")
+    encode(message.version, code, message.request_id, &groups, &[]).expect("bounded response")
+}
+
+fn collection_field(bytes: &mut Vec<u8>, tag: u8, name: &str, value: &[u8]) {
+    bytes.push(tag);
+    bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(value);
+}
+
+fn media_collection(bytes: &mut Vec<u8>, name: &str) {
+    collection_field(bytes, BEGIN_COLLECTION, name, &[]);
+    for margin in [
+        "media-bottom-margin",
+        "media-left-margin",
+        "media-right-margin",
+        "media-top-margin",
+    ] {
+        collection_field(bytes, MEMBER_ATTR_NAME, "", margin.as_bytes());
+        collection_field(bytes, INTEGER, "", &0i32.to_be_bytes());
+    }
+    collection_field(bytes, MEMBER_ATTR_NAME, "", b"media-size");
+    collection_field(bytes, BEGIN_COLLECTION, "", &[]);
+    for (member, dimension) in [("x-dimension", 21000i32), ("y-dimension", 29700)] {
+        collection_field(bytes, MEMBER_ATTR_NAME, "", member.as_bytes());
+        collection_field(bytes, INTEGER, "", &dimension.to_be_bytes());
+    }
+    collection_field(bytes, END_COLLECTION, "", &[]);
+    collection_field(bytes, END_COLLECTION, "", &[]);
+}
+
+fn printer_reply(message: &Message<'_>, printer: &SharedPrinter, uri: &str) -> Vec<u8> {
+    let mut bytes = reply(
+        message,
+        SUCCESSFUL_OK,
+        vec![printer_group(printer, uri)],
+        "",
+    );
+    assert_eq!(bytes.pop(), Some(0x03));
+    media_collection(&mut bytes, "media-col-default");
+    media_collection(&mut bytes, "media-col-database");
+    bytes.push(0x03);
+    bytes
 }
 fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8]) -> Vec<u8> {
     let message = match parse(bytes) {
@@ -136,10 +200,10 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
         }
     };
     let fail = |code, detail: &str| reply(&message, code, vec![], detail);
-    if message.version != (1, 1) {
+    if !matches!(message.version, (1, 1) | (2, 0)) {
         return fail(
             SERVER_ERROR_VERSION_NOT_SUPPORTED,
-            "Only IPP 1.1 is supported",
+            "Only IPP 1.1 and 2.0 are supported",
         );
     }
     if text(&message, "attributes-charset") != Some("utf-8")
@@ -206,12 +270,7 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
         return fail(CLIENT_ERROR_BAD_REQUEST, "Unexpected document");
     }
     match message.code {
-        GET_PRINTER_ATTRIBUTES => reply(
-            &message,
-            SUCCESSFUL_OK,
-            vec![printer_group(&printer, &uri)],
-            "",
-        ),
+        GET_PRINTER_ATTRIBUTES => printer_reply(&message, &printer, &uri),
         VALIDATE_JOB | PRINT_JOB => {
             if parts.len() != 4 {
                 return fail(CLIENT_ERROR_BAD_REQUEST, "Expected printer route");
@@ -413,6 +472,7 @@ fn printer_group(p: &SharedPrinter, uri: &str) -> Group {
         ),
         Attribute::boolean("printer-is-accepting-jobs", p.enabled),
         Attribute::text(KEYWORD, "ipp-versions-supported", "1.1"),
+        Attribute::text(KEYWORD, "ipp-versions-supported", "2.0"),
         Attribute::text(CHARSET, "charset-configured", "utf-8"),
         Attribute::text(CHARSET, "charset-supported", "utf-8"),
         Attribute::text(NATURAL_LANGUAGE, "natural-language-configured", "en"),
@@ -433,6 +493,10 @@ fn printer_group(p: &SharedPrinter, uri: &str) -> Group {
         ),
         Attribute::text(KEYWORD, "media-supported", "iso_a4_210x297mm"),
         Attribute::text(KEYWORD, "media-default", "iso_a4_210x297mm"),
+        Attribute::integer(INTEGER, "media-bottom-margin-supported", 0),
+        Attribute::integer(INTEGER, "media-left-margin-supported", 0),
+        Attribute::integer(INTEGER, "media-right-margin-supported", 0),
+        Attribute::integer(INTEGER, "media-top-margin-supported", 0),
         Attribute::text(KEYWORD, "sides-default", "one-sided"),
         Attribute::integer(INTEGER, "copies-default", 1),
         Attribute::boolean("multiple-document-jobs-supported", false),
@@ -555,27 +619,79 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_wrong_and_revoked_credentials_without_reading_body() {
+    fn permits_unauthenticated_capability_queries_only() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (_directory, bridge, device) = fixture();
-            for auth in [
-                None,
-                Some(STANDARD.encode(format!("{}:wrong", device.device.id))),
-            ] {
-                let mut request = Request::builder()
+            let (_directory, bridge, _) = fixture();
+            for operation in [GET_PRINTER_ATTRIBUTES, PRINT_JOB] {
+                let request = Request::builder()
                     .method("POST")
                     .uri("/ipp/printers/office")
-                    .header(header::CONTENT_TYPE, "application/ipp");
-                if let Some(auth) = auth {
-                    request = request.header(header::AUTHORIZATION, format!("Basic {auth}"));
-                }
-                let response = router(Arc::clone(&bridge))
-                    .oneshot(request.body(Body::new(UnreadBody)).unwrap())
-                    .await
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/ipp")
+                    .body(Body::from(request_bytes(operation, "office", vec![], &[])))
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-                assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+                let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+                if operation == PRINT_JOB {
+                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                    assert!(bridge.list_jobs().unwrap().is_empty());
+                } else {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let bytes = to_bytes(response.into_body(), MAX_ATTRIBUTE_BYTES)
+                        .await
+                        .unwrap();
+                    let message = parse(&bytes).unwrap();
+                    assert_eq!(message.code, SUCCESSFUL_OK);
+                    assert_eq!(
+                        text(&message, "document-format-supported"),
+                        Some("application/pdf")
+                    );
+                }
             }
+        });
+    }
+
+    #[test]
+    fn accepts_authenticated_ipp_2_pdf_job() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let mut bytes = request_bytes(PRINT_JOB, "office", vec![], &pdf_bytes());
+            bytes[0..2].copy_from_slice(&[2, 0]);
+            let auth = STANDARD.encode(format!("{}:{}", device.device.id, device.token));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ipp/printers/office")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .header(header::AUTHORIZATION, format!("Basic {auth}"))
+                .body(Body::from(bytes))
+                .unwrap();
+            let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), MAX_ATTRIBUTE_BYTES)
+                .await
+                .unwrap();
+            let message = parse(&bytes).unwrap();
+            assert_eq!(message.version, (2, 0));
+            assert_eq!(message.code, SUCCESSFUL_OK);
+            assert_eq!(bridge.list_jobs().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn rejects_wrong_and_revoked_credentials_without_reading_body() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let auth = STANDARD.encode(format!("{}:wrong", device.device.id));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ipp/printers/office")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .header(header::AUTHORIZATION, format!("Basic {auth}"))
+                .body(Body::new(UnreadBody))
+                .unwrap();
+            let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
             bridge.revoke_device(&device.device.id).unwrap();
             let auth = STANDARD.encode(format!("{}:{}", device.device.id, device.token));
             let request = Request::builder()

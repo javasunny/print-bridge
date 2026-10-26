@@ -31,6 +31,8 @@ pub const BOOLEAN: u8 = 0x22;
 pub const ENUM: u8 = 0x23;
 pub const OCTET_STRING: u8 = 0x30;
 pub const RANGE_OF_INTEGER: u8 = 0x33;
+pub const BEGIN_COLLECTION: u8 = 0x34;
+pub const END_COLLECTION: u8 = 0x37;
 pub const TEXT: u8 = 0x41;
 pub const NAME: u8 = 0x42;
 pub const KEYWORD: u8 = 0x44;
@@ -38,6 +40,7 @@ pub const URI: u8 = 0x45;
 pub const CHARSET: u8 = 0x47;
 pub const NATURAL_LANGUAGE: u8 = 0x48;
 pub const MIME_MEDIA_TYPE: u8 = 0x49;
+pub const MEMBER_ATTR_NAME: u8 = 0x4a;
 
 pub const MAX_ATTRIBUTES: usize = 256;
 pub const MAX_GROUPS: usize = 64;
@@ -180,6 +183,46 @@ fn validate_value(tag: u8, value: &[u8]) -> Result<(), Error> {
     }
 }
 
+fn skip_collection(bytes: &[u8], cursor: &mut usize, depth: usize) -> Result<(), Error> {
+    if depth > 4 {
+        return Err(Error("collection nesting too deep"));
+    }
+    for _ in 0..MAX_ATTRIBUTES {
+        let tag = take(bytes, cursor, 1)?[0];
+        if length(bytes, cursor)? != 0 {
+            return Err(Error("collection field has a name"));
+        }
+        let value_length = length(bytes, cursor)?;
+        let value = take(bytes, cursor, value_length)?;
+        if tag == END_COLLECTION {
+            return if value.is_empty() {
+                Ok(())
+            } else {
+                Err(Error("invalid collection end"))
+            };
+        }
+        if tag != MEMBER_ATTR_NAME {
+            return Err(Error("missing collection member name"));
+        }
+        validate_name(std::str::from_utf8(value).map_err(|_| Error("invalid member name"))?)?;
+        let tag = take(bytes, cursor, 1)?[0];
+        if length(bytes, cursor)? != 0 {
+            return Err(Error("collection member has a name"));
+        }
+        let value_length = length(bytes, cursor)?;
+        let value = take(bytes, cursor, value_length)?;
+        if tag == BEGIN_COLLECTION {
+            if !value.is_empty() {
+                return Err(Error("invalid collection start"));
+            }
+            skip_collection(bytes, cursor, depth + 1)?;
+        } else {
+            validate_value(tag, value)?;
+        }
+    }
+    Err(Error("too many collection members"))
+}
+
 pub fn parse(bytes: &[u8]) -> Result<Message<'_>, Error> {
     if bytes.len() > MAX_DOCUMENT_BYTES + MAX_ATTRIBUTE_BYTES + 8 {
         return Err(Error("message exceeds size limit"));
@@ -253,7 +296,14 @@ pub fn parse(bytes: &[u8]) -> Result<Message<'_>, Error> {
         };
         let value_length = length(bytes, &mut cursor)?;
         let value = take(bytes, &mut cursor, value_length)?;
-        validate_value(tag, value)?;
+        if tag == BEGIN_COLLECTION {
+            if !value.is_empty() {
+                return Err(Error("invalid collection start"));
+            }
+            skip_collection(bytes, &mut cursor, 1)?;
+        } else {
+            validate_value(tag, value)?;
+        }
         if cursor - 8 >= MAX_ATTRIBUTE_BYTES {
             return Err(Error("attributes exceed size limit"));
         }

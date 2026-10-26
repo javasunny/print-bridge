@@ -1,7 +1,48 @@
 #![cfg(target_os = "macos")]
 
 use print_bridge::{Bridge, SharedPrinter};
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+fn assert_pdf_output(ppd: &Path) {
+    let checked = Command::new("cupstestppd")
+        .arg("-q")
+        .arg(ppd)
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stdout)
+    );
+    let filtered = Command::new("cupsfilter")
+        .args(["-e", "-p", ppd.to_str().unwrap(), "-m", "printer/office"])
+        .arg("/usr/share/cups/ipptool/document-a4.pdf")
+        .output()
+        .unwrap();
+    assert!(
+        filtered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    assert!(
+        filtered.stdout.starts_with(b"%PDF-"),
+        "PPD emitted a non-PDF document: {}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let pdf = lopdf::Document::load_mem(&filtered.stdout).unwrap();
+    assert_eq!(pdf.get_pages().len(), 4);
+}
+
+#[test]
+fn bundled_single_sided_ppd_outputs_valid_pdf() {
+    let ppd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("macos/Print-Bridge-PDF-A4-Simplex.ppd");
+    assert_pdf_output(&ppd);
+}
 
 #[test]
 fn macos_can_probe_pdf_capabilities_without_credentials() {
@@ -65,25 +106,5 @@ fn macos_can_probe_pdf_capabilities_without_credentials() {
     assert!(ppd_text.contains("*PageSize A4"), "{ppd_text}");
     let generated_ppd = directory.path().join("generated.ppd");
     fs::write(&generated_ppd, ppd_text).unwrap();
-    let filtered = Command::new("cupsfilter")
-        .args([
-            "-e",
-            "-p",
-            generated_ppd.to_str().unwrap(),
-            "-m",
-            "printer/office",
-        ])
-        .arg("/usr/share/cups/ipptool/document-a4.pdf")
-        .output()
-        .unwrap();
-    assert!(
-        filtered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&filtered.stderr)
-    );
-    assert!(
-        filtered.stdout.starts_with(b"%PDF-"),
-        "generated PPD emitted a non-PDF document: {}",
-        String::from_utf8_lossy(&filtered.stderr)
-    );
+    assert_pdf_output(&generated_ppd);
 }

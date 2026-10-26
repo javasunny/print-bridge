@@ -10,6 +10,8 @@
 
 2026-10-26 macOS 兼容性修正后重新交叉构建了 Windows x64 EXE 和 NSIS 安装包。新版本允许匿名读取 IPP 能力，并响应 IPP 2.0 的现有操作。45 项 Rust 核心测试、3 项文档测试、1 项 macOS IPP 模拟探测和 4 项前端测试通过。本机模拟服务经 macOS `ipp2ppd` 探测可生成 PDF 过滤规则和 A4 纸张配置，`cupsfilter` 离线输出保持 PDF；真实添加、认证和出纸仍按下表验证。
 
+Windows 服务更新后的联机只读查询确认 PDF/A4 能力正常，但 macOS 原生 Auto Select 仍选择 Generic PostScript。为此提供显式选择的 A4 单面 PPD，配置由在线服务能力生成；PPD 语法和离线 PDF 输出均通过测试。原生 Use → Other 添加、认证与出纸仍待验证。
+
 ## 首次下载打印组件
 
 安装应用后，打开“设置 → 下载打印组件”。应用只从固定的 SumatraPDF 官方 HTTPS 地址下载 3.6.1 x64 portable ZIP，核对锁定的 SHA-256 后提取指定 EXE，再校验 EXE 摘要。不会自动下载或自动执行打印。

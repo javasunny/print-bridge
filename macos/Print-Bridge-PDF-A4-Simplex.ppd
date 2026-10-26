@@ -1,0 +1,52 @@
+*PPD-Adobe: "4.3"
+*% PPD created by ipp2ppd (v4:Aug  8 2026)
+*FormatVersion: "4.3"
+*FileVersion: "4.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PSVersion: "(3010.000) 0"
+*LanguageLevel: "3"
+*FileSystem: False
+*cupsVersion: 2.0
+*cupsModelNumber: 0
+*cupsSNMPSupplies: False
+*APAirPrint: True
+*APAirPrintVersion: 1.1
+*APURFVersion: 1.1
+*cupsLanguages: "en"
+*PCFileName: "APPRINTB.PPD"
+*ModelName: "Print Bridge PDF A4 Single-Sided"
+*Product: "(Print Bridge PDF A4 Single-Sided)"
+*ShortNickName: "Print Bridge PDF A4"
+*Manufacturer: "Print Bridge"
+*NickName: "Print Bridge PDF A4 Single-Sided"
+*cupsSingleFile: True
+*cupsFilter2: "application/vnd.cups-pdf application/pdf 0 maxsize(0) -"
+*cupsFilter: "application/vnd.cups-pdf 0 -"
+*cupsMaxCopies: 99
+*ColorDevice: False
+*APColorSpaces: true
+*DefaultColorSpace: Gray
+*cupsICCProfile Gray../Grayscale: "/System/Library/ColorSync/Profiles/Generic Gray Gamma 2.2 Profile.icc"
+*OpenUI *ColorModel/Color Mode: PickOne
+*OrderDependency: 10 AnySetup *ColorModel
+*DefaultColorModel: Gray
+*ColorModel Gray/Grayscale: "<</cupsColorSpace 18/cupsBitsPerColor 8/cupsColorOrder 0/cupsCompression 0>>setpagedevice"
+*CloseUI: *ColorModel
+*LandscapeOrientation: Plus90
+*cupsBackSide: Normal
+*DefaultOutputOrder: Normal
+*OpenUI *PageSize/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*DefaultPageSize: A4
+*PageSize A4: "<</PageSize[595.2756 841.8898]/ImagingBBox null/Orientation 0>>setpagedevice"
+*CloseUI: *PageSize
+*OpenUI *PageRegion/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*DefaultPageRegion: A4
+*PageRegion A4: "<</PageSize[595.2756 841.8898]/ImagingBBox null/Orientation 0>>setpagedevice"
+*CloseUI: *PageRegion
+*DefaultImageableArea: A4
+*DefaultPaperDimension: A4
+*PaperDimension A4: "595.2756 841.8898"
+*ImageableArea A4: "0.0000 0.0000 595.2756 841.8898"

@@ -12,7 +12,7 @@ cargo run --manifest-path desktop/Cargo.toml --locked
 
 首次使用时在“设置”点击“下载打印组件”；从官方网站下载并校验 SumatraPDF 后即可使用。在“共享打印机”选择本机队列并保存；创建设备凭据后，设置 Windows 局域网监听地址，再启动服务。默认只监听 `127.0.0.1:8631`。
 
-macOS 添加时，在“打印机与扫描仪 → 添加打印机 → IP”填写：Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`，Use 先选 Auto Select。更新后的服务允许匿名读取打印机 PDF/A4 能力，但打印任务仍需设备 ID 和令牌认证。若 Auto Select 仍选 Generic PostScript Printer，不要用该驱动提交任务；记录 macOS 版本与添加结果继续排查。
+macOS 添加时，在“打印机与扫描仪 → 添加打印机 → IP”填写：Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。若 Auto Select 仍选 Generic PostScript Printer，在 Use 选择 Other，打开仓库内的 [Print-Bridge-PDF-A4-Simplex.ppd](../macos/Print-Bridge-PDF-A4-Simplex.ppd)，确认显示 `Print Bridge PDF A4 Single-Sided` 后添加。此配置用于 A4 单面队列，不提供双面选项；不含地址或凭据，无需重建 Windows 安装包。更新后的服务允许匿名读取打印机 PDF/A4 能力，但打印任务仍需设备 ID 和令牌认证。
 
 关闭窗口隐藏到系统托盘；在托盘选择“打开 Print Bridge”可恢复窗口。“停止服务并退出”先停止接收和领取任务，若仍有打印调用则拒绝退出并提示稍后重试，不强行终止打印。
 

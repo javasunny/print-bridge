@@ -5,6 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 fn assert_pdf_output(ppd: &Path) {
@@ -42,6 +43,108 @@ fn bundled_single_sided_ppd_outputs_valid_pdf() {
     let ppd =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("macos/Print-Bridge-PDF-A4-Simplex.ppd");
     assert_pdf_output(&ppd);
+}
+
+struct TemporaryQueue(String);
+impl Drop for TemporaryQueue {
+    fn drop(&mut self) {
+        let _ = Command::new("lpadmin").args(["-x", &self.0]).output();
+    }
+}
+
+#[test]
+#[ignore = "Creates and removes a temporary local CUPS queue; requires printer administration access"]
+fn native_macos_queue_prints_pdf_without_authentication_in_simulation() {
+    let directory = tempfile::tempdir().unwrap();
+    let bridge = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+    bridge
+        .save_printer(SharedPrinter {
+            id: "office".into(),
+            name: "Office".into(),
+            queue: "Simulated Queue".into(),
+            enabled: true,
+            duplex: false,
+            max_copies: 99,
+        })
+        .unwrap();
+    bridge.set_authentication_required(false).unwrap();
+    bridge.start("127.0.0.1:0").unwrap();
+    let uri = format!(
+        "ipp://{}/ipp/printers/office",
+        bridge.status().address.unwrap()
+    );
+    let ppd =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("macos/Print-Bridge-PDF-A4-Simplex.ppd");
+    let queue = TemporaryQueue(format!(
+        "PrintBridge_Compatibility_Test_{}",
+        std::process::id()
+    ));
+    let configured = Command::new("lpadmin")
+        .args([
+            "-p",
+            &queue.0,
+            "-E",
+            "-v",
+            &uri,
+            "-P",
+            ppd.to_str().unwrap(),
+            "-o",
+            "printer-is-shared=false",
+            "-o",
+            "auth-info-required=none",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        configured.status.success(),
+        "{}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let submitted = Command::new("lp")
+        .args([
+            "-d",
+            &queue.0,
+            "-o",
+            "media=A4",
+            "-o",
+            "sides=one-sided",
+            "/usr/share/cups/ipptool/document-a4.pdf",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        submitted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&submitted.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if bridge
+            .list_jobs()
+            .unwrap()
+            .iter()
+            .any(|job| job.state == "simulated")
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let status = Command::new("lpstat")
+                .args(["-p", &queue.0, "-l"])
+                .output()
+                .unwrap();
+            bridge.stop().unwrap();
+            panic!(
+                "Native queue did not reach simulation: {}",
+                String::from_utf8_lossy(&status.stdout)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bridge.stop().unwrap();
+    let jobs = bridge.list_jobs().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].device_id, "anonymous");
+    assert_eq!(jobs[0].state, "simulated");
 }
 
 #[test]

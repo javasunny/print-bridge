@@ -78,6 +78,11 @@ fn stop_service(bridge: Backend<'_>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_authentication_required(bridge: Backend<'_>, required: bool) -> Result<(), String> {
+    bridge.set_authentication_required(required)
+}
+
+#[tauri::command]
 async fn sumatra_status(manager: State<'_, Arc<SumatraManager>>) -> Result<DownloadStatus, String> {
     let manager = Arc::clone(manager.inner());
     tauri::async_runtime::spawn_blocking(move || manager.status())
@@ -176,6 +181,7 @@ pub fn run() {
             cancel_job,
             start_service,
             stop_service,
+            set_authentication_required,
             sumatra_status,
             download_sumatra
         ])

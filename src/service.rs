@@ -1,6 +1,6 @@
 use crate::{
     ipp::*,
-    store::{Bridge, Job, SharedPrinter, MAX_PDF},
+    store::{Bridge, Job, SharedPrinter, ANONYMOUS_DEVICE, MAX_PDF},
 };
 use axum::{
     body::to_bytes,
@@ -54,12 +54,18 @@ async fn handle(State(server): State<Server>, request: Request) -> Response {
         .and_then(|s| STANDARD.decode(s).ok())
         .and_then(|b| String::from_utf8(b).ok());
     let credentials = auth.as_deref().and_then(|s| s.split_once(':'));
-    if request.headers().contains_key(header::AUTHORIZATION)
+    let authentication_required = server.bridge.authentication_required();
+    if authentication_required
+        && request.headers().contains_key(header::AUTHORIZATION)
         && !credentials.is_some_and(|(device, token)| server.bridge.authenticate(device, token))
     {
         return unauthorized();
     }
-    let device = credentials.map(|(device, _)| device.to_string());
+    let device = if authentication_required {
+        credentials.map(|(device, _)| device.to_string())
+    } else {
+        Some(ANONYMOUS_DEVICE.to_string())
+    };
     if request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -166,11 +172,16 @@ fn media_collection(bytes: &mut Vec<u8>, name: &str) {
     collection_field(bytes, END_COLLECTION, "", &[]);
 }
 
-fn printer_reply(message: &Message<'_>, printer: &SharedPrinter, uri: &str) -> Vec<u8> {
+fn printer_reply(
+    message: &Message<'_>,
+    printer: &SharedPrinter,
+    uri: &str,
+    authentication_required: bool,
+) -> Vec<u8> {
     let mut bytes = reply(
         message,
         SUCCESSFUL_OK,
-        vec![printer_group(printer, uri)],
+        vec![printer_group(printer, uri, authentication_required)],
         "",
     );
     assert_eq!(bytes.pop(), Some(0x03));
@@ -220,7 +231,18 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
         "media",
         "document-format",
     ] {
-        if message.attributes(name).count() > 1 {
+        let attributes: Vec<_> = message.attributes(name).collect();
+        // macOS appends an octet-stream fallback; accept only this PDF pair and still validate the document.
+        let macos_pdf_format = name == "document-format"
+            && attributes.len() == 2
+            && attributes.iter().all(|a| a.tag == MIME_MEDIA_TYPE)
+            && attributes
+                .iter()
+                .any(|a| a.as_str() == Some("application/pdf"))
+            && attributes
+                .iter()
+                .any(|a| a.as_str() == Some("application/octet-stream"));
+        if attributes.len() > 1 && !macos_pdf_format {
             return fail(
                 CLIENT_ERROR_BAD_REQUEST,
                 "Duplicate single-valued attribute",
@@ -270,7 +292,9 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
         return fail(CLIENT_ERROR_BAD_REQUEST, "Unexpected document");
     }
     match message.code {
-        GET_PRINTER_ATTRIBUTES => printer_reply(&message, &printer, &uri),
+        GET_PRINTER_ATTRIBUTES => {
+            printer_reply(&message, &printer, &uri, bridge.authentication_required())
+        }
         VALIDATE_JOB | PRINT_JOB => {
             if parts.len() != 4 {
                 return fail(CLIENT_ERROR_BAD_REQUEST, "Expected printer route");
@@ -393,10 +417,21 @@ fn options<'a>(
     }
     for group in &m.groups {
         if group.tag == JOB_ATTRIBUTES
-            && group
-                .attributes
-                .iter()
-                .any(|a| !matches!(a.name.as_str(), "copies" | "sides" | "media"))
+            && group.attributes.iter().any(|a| {
+                !matches!(
+                    a.name.as_str(),
+                    "copies"
+                        | "sides"
+                        | "media"
+                        | "PageSize"
+                        | "number-up"
+                        | "finishings"
+                        | "document-name-supplied"
+                        | "job-name"
+                        | "job-originating-host-name"
+                        | "job-uuid"
+                )
+            })
         {
             return Err((
                 CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
@@ -404,7 +439,11 @@ fn options<'a>(
             ));
         }
     }
-    if text(m, "document-format").unwrap_or("application/pdf") != "application/pdf" {
+    if m.attribute("document-format").is_some()
+        && !m
+            .attributes("document-format")
+            .any(|a| a.as_str() == Some("application/pdf"))
+    {
         return Err((
             CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED,
             "Only application/pdf is supported",
@@ -424,20 +463,30 @@ fn options<'a>(
         None => 1,
     };
     let sides = text(m, "sides").unwrap_or("one-sided");
-    if text(m, "media").is_some_and(|s| s != "iso_a4_210x297mm") {
+    if text(m, "media").is_some_and(|s| !matches!(s, "iso_a4_210x297mm" | "A4")) {
         return Err((
             CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
             "Only A4 is supported",
         ));
     }
+    if m.attributes("PageSize")
+        .any(|a| a.tag != NAME || a.as_str() != Some("A4"))
+        || m.attributes("number-up")
+            .any(|a| a.tag != INTEGER || a.as_i32() != Some(1))
+        || m.attributes("finishings")
+            .any(|a| a.tag != ENUM || a.as_i32() != Some(3))
+    {
+        return Err((
+            CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+            "Unsupported page size, number-up or finishing",
+        ));
+    }
     for name in [
         "page-ranges",
-        "number-up",
         "orientation-requested",
         "print-color-mode",
         "media-col",
         "printer-resolution",
-        "finishings",
         "output-bin",
         "print-quality",
     ] {
@@ -456,10 +505,18 @@ fn options<'a>(
     })?;
     Ok((copies, sides))
 }
-fn printer_group(p: &SharedPrinter, uri: &str) -> Group {
+fn printer_group(p: &SharedPrinter, uri: &str, authentication_required: bool) -> Group {
     let mut a = vec![
         Attribute::text(URI, "printer-uri-supported", uri),
-        Attribute::text(KEYWORD, "uri-authentication-supported", "basic"),
+        Attribute::text(
+            KEYWORD,
+            "uri-authentication-supported",
+            if authentication_required {
+                "basic"
+            } else {
+                "none"
+            },
+        ),
         Attribute::text(KEYWORD, "uri-security-supported", "none"),
         Attribute::text(NAME, "printer-name", &p.name),
         Attribute::text(TEXT, "printer-info", &p.name),
@@ -678,6 +735,131 @@ mod tests {
     }
 
     #[test]
+    fn disabled_authentication_accepts_anonymous_pdf_and_ignores_cached_credentials() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, _) = fixture();
+            bridge.running.store(false, Ordering::SeqCst);
+            bridge.set_authentication_required(false).unwrap();
+            bridge.running.store(true, Ordering::SeqCst);
+            for auth in [None, Some("Basic invalid")] {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri("/ipp/printers/office")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/ipp");
+                if let Some(auth) = auth {
+                    request = request.header(header::AUTHORIZATION, auth);
+                }
+                let response = router(Arc::clone(&bridge))
+                    .oneshot(
+                        request
+                            .body(Body::from(request_bytes(
+                                PRINT_JOB,
+                                "office",
+                                vec![],
+                                &pdf_bytes(),
+                            )))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), MAX_ATTRIBUTE_BYTES)
+                    .await
+                    .unwrap();
+                assert_eq!(parse(&bytes).unwrap().code, SUCCESSFUL_OK);
+            }
+            let jobs = bridge.list_jobs().unwrap();
+            assert_eq!(jobs.len(), 2);
+            assert!(jobs.iter().all(|job| job.device_id == ANONYMOUS_DEVICE));
+            let query = request_bytes(GET_PRINTER_ATTRIBUTES, "office", vec![], &[]);
+            let bytes = dispatch(
+                &bridge,
+                ANONYMOUS_DEVICE,
+                "localhost",
+                "/ipp/printers/office",
+                &query,
+            );
+            assert_eq!(
+                text(&parse(&bytes).unwrap(), "uri-authentication-supported"),
+                Some("none")
+            );
+            bridge.running.store(false, Ordering::SeqCst);
+            bridge.set_authentication_required(true).unwrap();
+            bridge.running.store(true, Ordering::SeqCst);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ipp/printers/office")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .body(Body::from(request_bytes(
+                    PRINT_JOB,
+                    "office",
+                    vec![],
+                    &pdf_bytes(),
+                )))
+                .unwrap();
+            let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(bridge.list_jobs().unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn native_macos_defaults_accept_pdf_but_still_validate_document_bytes() {
+        let (_directory, bridge, device) = fixture();
+        let mut operation = operation_attributes();
+        operation.attributes.extend([
+            Attribute::text(URI, "printer-uri", "ipp://localhost/ipp/printers/office"),
+            Attribute::text(MIME_MEDIA_TYPE, "document-format", "application/pdf"),
+            Attribute::text(
+                MIME_MEDIA_TYPE,
+                "document-format",
+                "application/octet-stream",
+            ),
+        ]);
+        let job = Group::new(
+            JOB_ATTRIBUTES,
+            vec![
+                Attribute::text(NAME, "document-name-supplied", "test.pdf"),
+                Attribute::integer(ENUM, "finishings", 3),
+                Attribute::text(NAME, "job-originating-host-name", "localhost"),
+                Attribute::text(URI, "job-uuid", "urn:uuid:compatibility-test"),
+                Attribute::text(KEYWORD, "media", "A4"),
+                Attribute::integer(INTEGER, "number-up", 1),
+                Attribute::text(NAME, "PageSize", "A4"),
+                Attribute::text(KEYWORD, "sides", "one-sided"),
+            ],
+        );
+        let mut groups = [operation, job];
+        let pdf = pdf_bytes();
+        for (document, expected) in [
+            (pdf.as_slice(), SUCCESSFUL_OK),
+            (b"not a PDF".as_slice(), CLIENT_ERROR_NOT_POSSIBLE),
+        ] {
+            let bytes = encode((2, 0), PRINT_JOB, 17, &groups, document).unwrap();
+            let response = dispatch(
+                &bridge,
+                &device.device.id,
+                "localhost",
+                "/ipp/printers/office",
+                &bytes,
+            );
+            assert_eq!(parse(&response).unwrap().code, expected);
+        }
+        assert_eq!(bridge.list_jobs().unwrap().len(), 1);
+        groups[0].attributes.last_mut().unwrap().value = b"application/postscript".to_vec();
+        let bytes = encode((2, 0), PRINT_JOB, 18, &groups, &pdf).unwrap();
+        let response = dispatch(
+            &bridge,
+            &device.device.id,
+            "localhost",
+            "/ipp/printers/office",
+            &bytes,
+        );
+        assert_eq!(parse(&response).unwrap().code, CLIENT_ERROR_BAD_REQUEST);
+    }
+
+    #[test]
     fn rejects_wrong_and_revoked_credentials_without_reading_body() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (_directory, bridge, device) = fixture();
@@ -893,6 +1075,14 @@ mod tests {
                 ),
                 (
                     Attribute::integer(INTEGER, "number-up", 2),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::text(NAME, "PageSize", "Letter"),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::integer(ENUM, "finishings", 4),
                     CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
                 ),
             ] {

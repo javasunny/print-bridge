@@ -17,6 +17,7 @@ use std::{
 use subtle::ConstantTimeEq;
 
 pub(crate) const MAX_PDF: usize = 100 * 1024 * 1024;
+pub(crate) const ANONYMOUS_DEVICE: &str = "anonymous";
 const QUOTA: u64 = 2 * 1024 * 1024 * 1024;
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
@@ -74,6 +75,7 @@ pub struct ServiceStatus {
     pub running: bool,
     pub simulation: bool,
     pub address: Option<String>,
+    pub authentication_required: bool,
 }
 pub struct Bridge {
     pub(crate) db: Mutex<Connection>,
@@ -81,6 +83,7 @@ pub struct Bridge {
     simulation: bool,
     sumatra: PathBuf,
     pub(crate) running: AtomicBool,
+    authentication_required: AtomicBool,
     service: Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>,
     worker_active: AtomicBool,
     server_active: AtomicBool,
@@ -107,15 +110,26 @@ impl Bridge {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
             CREATE TABLE IF NOT EXISTS printers(id TEXT PRIMARY KEY, config TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,name TEXT NOT NULL,hash TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,printer_id TEXT NOT NULL,queue TEXT NOT NULL,copies INTEGER NOT NULL,sides TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,file TEXT NOT NULL,digest TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state,id);").map_err(err)?;
         db.execute("UPDATE jobs SET state='uncertain',detail='应用退出前正在调用打印程序，请检查 Windows 队列及出纸情况',updated_at=? WHERE state='processing'", [now()]).map_err(err)?;
+        let authentication_required = db
+            .query_row(
+                "SELECT value FROM settings WHERE key='authentication_required'",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(err)?
+            .unwrap_or(true);
         let bridge = Arc::new(Self {
             db: Mutex::new(db),
             root,
             simulation,
             sumatra,
             running: AtomicBool::new(false),
+            authentication_required: AtomicBool::new(authentication_required),
             service: Mutex::new(None),
             worker_active: AtomicBool::new(false),
             server_active: AtomicBool::new(false),
@@ -262,6 +276,19 @@ impl Bridge {
             .map(|h| bool::from(h.as_bytes().ct_eq(hash(token.as_bytes()).as_bytes())))
             .unwrap_or(false)
     }
+    pub fn authentication_required(&self) -> bool {
+        self.authentication_required.load(Ordering::SeqCst)
+    }
+    pub fn set_authentication_required(&self, required: bool) -> Result<()> {
+        let _service = self.service.lock().unwrap();
+        if self.running.load(Ordering::SeqCst) {
+            return Err("请先停止服务，再修改认证设置".into());
+        }
+        self.db.lock().unwrap().execute("INSERT INTO settings(key,value) VALUES('authentication_required',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [required]).map_err(err)?;
+        self.authentication_required
+            .store(required, Ordering::SeqCst);
+        Ok(())
+    }
     pub fn list_jobs(&self) -> Result<Vec<Job>> {
         let db = self.db.lock().unwrap();
         let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at FROM jobs ORDER BY id DESC LIMIT 1000").map_err(err)?;
@@ -352,7 +379,7 @@ impl Bridge {
                 |r| r.get(0),
             )
             .map_err(err)?;
-        if !active {
+        if !active && !(device == ANONYMOUS_DEVICE && !self.authentication_required()) {
             return Err("设备令牌已撤销".into());
         }
         let config: String = tx
@@ -402,6 +429,7 @@ impl Bridge {
             running: self.running.load(Ordering::SeqCst),
             simulation: self.simulation,
             address: self.service.lock().unwrap().as_ref().map(|x| x.0.clone()),
+            authentication_required: self.authentication_required(),
         }
     }
     pub fn start(self: &Arc<Self>, addr: &str) -> Result<()> {
@@ -672,6 +700,22 @@ pub(crate) mod tests {
         let mut bytes = Vec::new();
         empty.save_to(&mut bytes).unwrap();
         assert!(validate_pdf(&bytes).is_err());
+    }
+
+    #[test]
+    fn authentication_setting_defaults_on_and_persists() {
+        let directory = tempfile::tempdir().unwrap();
+        let bridge = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+        assert!(bridge.status().authentication_required);
+        bridge.set_authentication_required(false).unwrap();
+        drop(bridge);
+        let bridge = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+        assert!(!bridge.status().authentication_required);
+        bridge.running.store(true, Ordering::SeqCst);
+        assert!(bridge.set_authentication_required(true).is_err());
+        bridge.running.store(false, Ordering::SeqCst);
+        bridge.set_authentication_required(true).unwrap();
+        assert!(bridge.authentication_required());
     }
 
     #[test]

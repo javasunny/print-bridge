@@ -158,10 +158,10 @@ fn length(bytes: &[u8], cursor: &mut usize) -> Result<usize, Error> {
 fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty()
         || name.len() > MAX_NAME_BYTES
-        || !name.as_bytes()[0].is_ascii_lowercase()
-        || !name.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'.'
-        })
+        || !name.as_bytes()[0].is_ascii_alphabetic()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     {
         return Err(Error("invalid attribute name"));
     }

@@ -49,6 +49,9 @@ async function refreshStatus() {
   $('start').disabled = service.running;
   $('stop').disabled = !service.running;
   $('address').disabled = service.running;
+  $('authentication-required').checked = service.authentication_required;
+  $('authentication-required').disabled = service.running;
+  $('save-authentication').disabled = service.running;
   if (service.address) $('address').value = service.address;
 }
 async function refreshQueues() {
@@ -114,7 +117,7 @@ async function refreshDevices() {
     }));
     list.append(row);
   }
-  if (!devices.length) empty(list, '创建设备凭据后，Mac 才能提交任务。');
+  if (!devices.length) empty(list, service.authentication_required ? '创建设备凭据后，Mac 才能提交任务。' : '认证已关闭，Mac 可以直接提交任务。');
 }
 for (const tab of document.querySelectorAll('[data-tab]')) tab.addEventListener('click', () => {
   for (const item of document.querySelectorAll('[data-tab]')) {
@@ -138,6 +141,11 @@ $('start').addEventListener('click', () => action(async () => {
 }));
 $('stop').addEventListener('click', () => action(async () => {
   await invoke('stop_service'); await refreshStatus(); await refreshPrinters(); message('服务已停止接收新任务，等待任务已保留。');
+}));
+$('save-authentication').addEventListener('click', () => action(async () => {
+  await invoke('set_authentication_required', { required: $('authentication-required').checked });
+  await refreshStatus(); await refreshDevices();
+  message(service.authentication_required ? '设备认证已开启。' : '设备认证已关闭，启动服务后可直接打印。');
 }));
 function hideSecret() { $('secret').hidden = true; $('secret-id').value = ''; $('secret-token').value = ''; }
 async function refreshSumatra() {

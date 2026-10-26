@@ -12,6 +12,10 @@
 
 Windows 服务更新后的联机只读查询确认 PDF/A4 能力正常，但 macOS 原生 Auto Select 仍选择 Generic PostScript。为此提供显式选择的 A4 单面 PPD，配置由在线服务能力生成；PPD 语法和离线 PDF 输出均通过测试。原生 Use → Other 添加、认证与出纸仍待验证。
 
+0.1.1 增加可保存的设备认证开关，并兼容 macOS 原生队列附带的 A4 别名、PageSize、单页布局、不装订和文档元数据，以及 PDF/通用二进制格式标记组合。只接受不改变输出的默认值，文件仍须通过 PDF 校验。48 项 Rust 核心测试、3 项文档测试、2 项 macOS 离线测试和 4 项前端测试通过，桌面构建和 Windows x64 安装包交叉构建成功。另已显式运行本机临时 CUPS 队列测试，验证免认证 PDF 提交、入库和模拟完成；临时队列自动删除，未向真实打印机出纸。Windows 端更新后须继续验证真实打印。
+
+原生队列测试需要本机打印机管理权限，单独执行：`cargo test --locked --test macos_ipp native_macos_queue -- --ignored`。常规测试不会创建系统打印机队列。
+
 ## 首次下载打印组件
 
 安装应用后，打开“设置 → 下载打印组件”。应用只从固定的 SumatraPDF 官方 HTTPS 地址下载 3.6.1 x64 portable ZIP，核对锁定的 SHA-256 后提取指定 EXE，再校验 EXE 摘要。不会自动下载或自动执行打印。

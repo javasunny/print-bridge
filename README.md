@@ -13,12 +13,13 @@ Windows 多打印机 IPP 桥接 MVP，使用 Tauri 和 Rust。macOS 通过各打
 - 打印目标固定，不回退到默认打印机；超时或非零退出不会自动重打。
 - 设置中手动下载 SumatraPDF 3.6.1 x64，固定官方地址与 SHA-256，校验成功后启用，下载失败可重试。
 - 模拟与正式数据隔离，单实例文件锁，上传并发与任务容量限制，终态 PDF 超期清理。
+- 连接诊断：显示来源 IP、请求时间、IPP 操作和处理结果，包含尚未进入任务列表的查询与拒绝请求。
 
 ## 运行
 
 用户直接安装 Windows 安装包。启动后打开“设置 → 下载打印组件”，下载完成后配置共享打印机和设备凭据。
 
-本机构建产物位于 `dist`：推荐安装 `Print Bridge_0.1.1_x64-setup.exe`，安装程序按需下载 WebView2；独立应用 `Print-Bridge-Windows-x64.exe` 要求系统已有 WebView2。两个文件均未签名。
+本机构建产物位于 `dist`：推荐安装 `Print Bridge_0.1.2_x64-setup.exe`，安装程序按需下载 WebView2；独立应用 `Print-Bridge-Windows-x64.exe` 要求系统已有 WebView2。两个文件均未签名。
 
 从源码运行时，Windows 开发环境需要 Rust MSVC 工具链、Visual Studio C++ 构建工具和 WebView2：
 
@@ -35,6 +36,8 @@ cargo run --manifest-path desktop/Cargo.toml --locked -- --simulate
 先保存至少一台共享打印机，再创建设备凭据。设备标识作为用户名，令牌作为密码。令牌只展示一次，服务端仅存哈希；不要将凭据写进打印机 URL。
 
 需要先跑通免认证流程时，停止服务，在“设置”取消勾选“要求设备认证”并保存，再启动服务。该设置重启后保留；关闭期间连接到服务的局域网设备均可打印，匿名任务共用一个身份。重新勾选保存即可恢复认证和设备任务隔离。
+
+Windows 的“连接诊断”页会自动刷新最近 100 条请求，关闭程序后清空。Mac 可使用 [只读 IPP 探测](macos/check-ipp-connection.test)验证连通性，操作说明见 [桌面说明](desktop/README.md#连接诊断)。探测不会创建打印任务；只有 Print-Job 成功才表示 PDF 已进入桥接任务列表。
 
 默认监听 `127.0.0.1:8631`。用于局域网时改为 Windows 的局域网 IP 和端口，并仅为私有网络配置 Windows 防火墙。当前 HTTP 不加密凭据与 PDF，只适用于可信局域网。
 

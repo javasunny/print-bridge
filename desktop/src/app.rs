@@ -1,7 +1,7 @@
 use print_bridge::{
     download::{DownloadStatus, SumatraManager},
     printing::{self, PrinterInfo},
-    Bridge, CreatedDevice, Device, Job, ServiceStatus, SharedPrinter,
+    Bridge, ConnectionEvent, CreatedDevice, Device, Job, ServiceStatus, SharedPrinter,
 };
 use std::sync::Arc;
 use tauri::{
@@ -56,6 +56,10 @@ fn revoke_device(bridge: Backend<'_>, id: String) -> Result<(), String> {
 #[tauri::command]
 fn list_jobs(bridge: Backend<'_>) -> Result<Vec<Job>, String> {
     bridge.list_jobs()
+}
+#[tauri::command]
+fn list_connection_events(bridge: Backend<'_>) -> Vec<ConnectionEvent> {
+    bridge.connection_events()
 }
 #[tauri::command]
 fn cancel_job(bridge: Backend<'_>, id: i64) -> Result<(), String> {
@@ -178,6 +182,7 @@ pub fn run() {
             create_device,
             revoke_device,
             list_jobs,
+            list_connection_events,
             cancel_job,
             start_service,
             stop_service,

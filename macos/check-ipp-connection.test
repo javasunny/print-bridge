@@ -1,0 +1,14 @@
+{
+    NAME "Check Print Bridge connection without printing"
+    OPERATION Get-Printer-Attributes
+    VERSION 2.0
+    GROUP operation-attributes-tag
+    ATTR charset attributes-charset utf-8
+    ATTR language attributes-natural-language en
+    ATTR uri printer-uri $uri
+    ATTR keyword requested-attributes printer-name,document-format-supported,uri-authentication-supported,printer-is-accepting-jobs
+    STATUS successful-ok
+    EXPECT printer-name
+    EXPECT document-format-supported WITH-VALUE application/pdf
+    EXPECT uri-authentication-supported
+}

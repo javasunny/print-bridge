@@ -1,17 +1,19 @@
 use crate::{
     ipp::*,
-    store::{Bridge, Job, SharedPrinter, ANONYMOUS_DEVICE, MAX_PDF},
+    store::{now, Bridge, ConnectionEvent, Job, SharedPrinter, ANONYMOUS_DEVICE, MAX_PDF},
 };
 use axum::{
     body::to_bytes,
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{header, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
     Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::{
+    net::SocketAddr,
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
@@ -22,14 +24,64 @@ struct Server {
     bridge: Arc<Bridge>,
     uploads: Arc<Semaphore>,
 }
+#[derive(Clone)]
+struct IppOutcome {
+    operation: Option<u16>,
+    status: u16,
+    detail: String,
+}
 pub(crate) fn router(bridge: Arc<Bridge>) -> Router {
     Router::new()
         .route("/ipp/printers/{printer}", post(handle))
         .route("/ipp/printers/{printer}/jobs/{job}", post(handle))
         .with_state(Server {
-            bridge,
+            bridge: Arc::clone(&bridge),
             uploads: Arc::new(Semaphore::new(4)),
         })
+        .layer(middleware::from_fn_with_state(bridge, record_connection))
+}
+async fn record_connection(
+    State(bridge): State<Arc<Bridge>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let client_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip().to_string());
+    let method = request.method().to_string();
+    let path = request.uri().path().chars().take(256).collect();
+    let timestamp = now();
+    let response = next.run(request).await;
+    let outcome = response.extensions().get::<IppOutcome>();
+    let detail = match outcome {
+        Some(outcome) => outcome.detail.clone(),
+        None => match response.status() {
+            StatusCode::UNAUTHORIZED => "认证失败或缺少设备凭据",
+            StatusCode::NOT_FOUND => "未找到队列地址，请检查 macOS 的 Queue",
+            StatusCode::METHOD_NOT_ALLOWED => "该地址需要 IPP POST 请求",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => "请求类型不是 application/ipp",
+            StatusCode::PAYLOAD_TOO_LARGE => "请求超过大小限制",
+            StatusCode::REQUEST_TIMEOUT => "读取请求超时",
+            StatusCode::SERVICE_UNAVAILABLE => "服务未启动或当前繁忙",
+            _ => response
+                .status()
+                .canonical_reason()
+                .unwrap_or("未知 HTTP 状态"),
+        }
+        .to_string(),
+    };
+    bridge.record_connection_event(ConnectionEvent {
+        timestamp,
+        client_ip,
+        method,
+        path,
+        operation: outcome.and_then(|outcome| outcome.operation),
+        http_status: response.status().as_u16(),
+        ipp_status: outcome.map(|outcome| outcome.status),
+        detail: detail.chars().take(512).collect(),
+    });
+    response
 }
 fn unauthorized() -> Response {
     (
@@ -116,6 +168,9 @@ async fn handle(State(server): State<Server>, request: Request) -> Response {
         return unauthorized();
     }
     let bridge = server.bridge;
+    let operation = body
+        .get(2..4)
+        .map(|code| u16::from_be_bytes([code[0], code[1]]));
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         dispatch(
@@ -128,7 +183,33 @@ async fn handle(State(server): State<Server>, request: Request) -> Response {
     })
     .await
     {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "application/ipp")], bytes).into_response(),
+        Ok(bytes) => {
+            let message = parse(&bytes).expect("encoded IPP response");
+            let detail = text(&message, "status-message")
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    if message.code >= CLIENT_ERROR_BAD_REQUEST {
+                        return "IPP 请求被拒绝".into();
+                    }
+                    match operation {
+                        Some(GET_PRINTER_ATTRIBUTES) => "打印机能力查询成功（尚未提交打印任务）",
+                        Some(VALIDATE_JOB) => "打印参数验证通过（尚未提交文档）",
+                        Some(PRINT_JOB) => "PDF 打印任务已接收",
+                        Some(GET_JOB_ATTRIBUTES | GET_JOBS) => "任务状态查询成功",
+                        Some(CANCEL_JOB) => "取消请求已处理",
+                        _ => "IPP 请求已响应",
+                    }
+                    .into()
+                });
+            let outcome = IppOutcome {
+                operation,
+                status: message.code,
+                detail,
+            };
+            let mut response = ([(header::CONTENT_TYPE, "application/ipp")], bytes).into_response();
+            response.extensions_mut().insert(outcome);
+            response
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -193,7 +274,7 @@ fn printer_reply(
 fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8]) -> Vec<u8> {
     let message = match parse(bytes) {
         Ok(m) => m,
-        Err(_) => {
+        Err(error) => {
             let id = bytes
                 .get(4..8)
                 .and_then(|s| s.try_into().ok())
@@ -204,7 +285,11 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
                 (1, 1),
                 CLIENT_ERROR_BAD_REQUEST,
                 id,
-                &[operation_attributes()],
+                &[Group::new(OPERATION_ATTRIBUTES, {
+                    let mut attributes = operation_attributes().attributes;
+                    attributes.push(Attribute::text(TEXT, "status-message", &error.to_string()));
+                    attributes
+                })],
                 &[],
             )
             .unwrap();
@@ -311,10 +396,7 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
             }
             match bridge.accept(device, &printer.id, copies, sides, message.document) {
                 Ok(job) => reply(&message, SUCCESSFUL_OK, vec![job_group(&job, &uri)], ""),
-                Err(_) => fail(
-                    CLIENT_ERROR_NOT_POSSIBLE,
-                    "PDF validation, capacity or current printer/device state rejected this job",
-                ),
+                Err(error) => fail(CLIENT_ERROR_NOT_POSSIBLE, &error),
             }
         }
         GET_JOB_ATTRIBUTES | CANCEL_JOB => {
@@ -708,6 +790,85 @@ mod tests {
     }
 
     #[test]
+    fn records_ipp_rejection_with_client_ip_without_credentials_or_document_metadata() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let authorization = STANDARD.encode(format!("{}:{}", device.device.id, device.token));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ipp/printers/office?access_token=private-query-value")
+                .extension(ConnectInfo(
+                    "192.0.2.10:54321".parse::<SocketAddr>().unwrap(),
+                ))
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .header(header::AUTHORIZATION, format!("Basic {authorization}"))
+                .body(Body::from(request_bytes(
+                    PRINT_JOB,
+                    "office",
+                    vec![
+                        Attribute::text(KEYWORD, "media", "na_letter_8.5x11in"),
+                        Attribute::text(NAME, "job-name", "private-document-title"),
+                    ],
+                    &pdf_bytes(),
+                )))
+                .unwrap();
+            let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let events = bridge.connection_events();
+            assert_eq!(events.len(), 1);
+            let event = &events[0];
+            assert_eq!(event.client_ip.as_deref(), Some("192.0.2.10"));
+            assert_eq!(event.path, "/ipp/printers/office");
+            assert_eq!(event.operation, Some(PRINT_JOB));
+            assert_eq!(event.http_status, 200);
+            assert_eq!(
+                event.ipp_status,
+                Some(CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED)
+            );
+            assert_eq!(event.detail, "Only A4 is supported");
+            let serialized = serde_json::to_string(&events).unwrap();
+            for secret in [
+                &device.token,
+                &authorization,
+                "private-query-value",
+                "private-document-title",
+            ] {
+                assert!(!serialized.contains(secret));
+            }
+            assert!(bridge.list_jobs().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn records_wrong_routes_and_methods_without_reading_request_body() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, _) = fixture();
+            for (method, path, status) in [
+                (
+                    "GET",
+                    "/ipp/printers/office",
+                    StatusCode::METHOD_NOT_ALLOWED,
+                ),
+                ("POST", "/wrong-queue-path", StatusCode::NOT_FOUND),
+            ] {
+                let request = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::new(UnreadBody))
+                    .unwrap();
+                let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), status);
+                let event = bridge.connection_events().remove(0);
+                assert_eq!(event.http_status, status.as_u16());
+                assert_eq!(event.path, path);
+                assert_eq!(event.ipp_status, None);
+            }
+            assert_eq!(bridge.connection_events().len(), 2);
+        });
+    }
+
+    #[test]
     fn accepts_authenticated_ipp_2_pdf_job() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (_directory, bridge, device) = fixture();
@@ -886,6 +1047,11 @@ mod tests {
             let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert!(bridge.list_jobs().unwrap().is_empty());
+            let events = bridge.connection_events();
+            assert_eq!(events.len(), 2);
+            assert!(events
+                .iter()
+                .all(|event| event.http_status == 401 && event.ipp_status.is_none()));
         });
     }
 

@@ -145,6 +145,12 @@ fn native_macos_queue_prints_pdf_without_authentication_in_simulation() {
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].device_id, "anonymous");
     assert_eq!(jobs[0].state, "simulated");
+    assert!(bridge
+        .connection_events()
+        .iter()
+        .any(|event| event.operation == Some(0x0002)
+            && event.ipp_status == Some(0)
+            && event.client_ip.as_deref() == Some("127.0.0.1")));
 }
 
 #[test]
@@ -164,14 +170,9 @@ fn macos_can_probe_pdf_capabilities_without_credentials() {
     bridge.start("127.0.0.1:0").unwrap();
     let address = bridge.status().address.unwrap();
     let uri = format!("ipp://{address}/ipp/printers/office");
-    let probe = directory.path().join("probe.test");
-    fs::write(
-        &probe,
-        "{ OPERATION Get-Printer-Attributes GROUP operation ATTR charset attributes-charset utf-8 ATTR language attributes-natural-language en ATTR uri printer-uri $uri STATUS successful-ok EXPECT document-format-supported }",
-    )
-    .unwrap();
+    let probe = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("macos/check-ipp-connection.test");
     let output = Command::new("ipptool")
-        .args(["-T", "5", "-V", "1.1", "-tv", &uri, probe.to_str().unwrap()])
+        .args(["-T", "5", "-tv", &uri, probe.to_str().unwrap()])
         .output()
         .unwrap();
     let ppd = directory.path().join("AirPrint.ppd");
@@ -189,6 +190,13 @@ fn macos_can_probe_pdf_capabilities_without_credentials() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("application/pdf"));
+    assert!(bridge
+        .connection_events()
+        .iter()
+        .any(|event| event.operation == Some(0x000b)
+            && event.ipp_status == Some(0)
+            && event.client_ip.as_deref() == Some("127.0.0.1")));
+    assert!(bridge.list_jobs().unwrap().is_empty());
     assert!(
         generated.status.success(),
         "ipp2ppd: {}\n{}",

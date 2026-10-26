@@ -1,4 +1,4 @@
-import { stateLabel, canCancel, printerUrl, printerFromForm } from './model.mjs';
+import { stateLabel, canCancel, printerUrl, printerFromForm, connectionResult } from './model.mjs';
 
 const $ = (id) => document.getElementById(id);
 const invoke = (command, args = {}) => window.__TAURI__.core.invoke(command, args);
@@ -106,6 +106,21 @@ async function refreshJobs() {
   }
   if (!filtered.length) empty(list, '暂无打印任务。');
 }
+async function refreshConnections() {
+  const events = await invoke('list_connection_events');
+  const list = $('connection-list'); list.replaceChildren();
+  const operations = { 2: '提交打印任务 · Print-Job', 4: '验证打印参数 · Validate-Job', 8: '取消任务 · Cancel-Job', 9: '查询任务状态 · Get-Job-Attributes', 10: '查询任务列表 · Get-Jobs', 11: '查询打印机 · Get-Printer-Attributes' };
+  for (const event of events) {
+    const result = connectionResult(event);
+    const { row, body } = card(`${event.client_ip || '来源未知'} · ${operations[event.operation] || (event.operation == null ? 'HTTP 请求' : `IPP 操作 ${event.operation}`)}`, result.label, result.failed);
+    body.append(node('p', new Date(event.timestamp * 1000).toLocaleString('zh-CN')));
+    body.append(node('code', `${event.method} ${event.path}`));
+    const ipp = event.ipp_status == null ? '' : ` · IPP 0x${event.ipp_status.toString(16).padStart(4, '0')}`;
+    body.append(node('p', `HTTP ${event.http_status}${ipp} · ${event.detail}`));
+    list.append(row);
+  }
+  if (!events.length) empty(list, '尚未收到请求。在 Mac 查询或打印后，来源 IP 和结果会显示在这里。');
+}
 async function refreshDevices() {
   const devices = await invoke('list_devices');
   const list = $('device-list'); list.replaceChildren();
@@ -125,7 +140,7 @@ for (const tab of document.querySelectorAll('[data-tab]')) tab.addEventListener(
     $(item.dataset.tab).hidden = !active;
   }
   if (tab.dataset.tab !== 'devices') hideSecret();
-  action(tab.dataset.tab === 'jobs' ? refreshJobs : tab.dataset.tab === 'devices' ? refreshDevices : tab.dataset.tab === 'settings' ? refreshSumatra : refreshPrinters);
+  action(tab.dataset.tab === 'connections' ? refreshConnections : tab.dataset.tab === 'jobs' ? refreshJobs : tab.dataset.tab === 'devices' ? refreshDevices : tab.dataset.tab === 'settings' ? refreshSumatra : refreshPrinters);
 });
 $('printer-form').addEventListener('submit', (event) => { event.preventDefault(); action(async () => {
   await invoke('save_printer', { printer: printerFromForm(new FormData(event.target)) });
@@ -135,6 +150,7 @@ function resetPrinter() { $('printer-form').reset(); $('printer-form').elements.
 $('reset-printer').addEventListener('click', resetPrinter);
 $('refresh-printers').addEventListener('click', () => action(async () => { await refreshQueues(); await refreshPrinters(); }));
 $('refresh-jobs').addEventListener('click', () => action(refreshJobs));
+$('refresh-connections').addEventListener('click', () => action(refreshConnections));
 $('filter').addEventListener('change', () => action(refreshJobs));
 $('start').addEventListener('click', () => action(async () => {
   await invoke('start_service', { address: $('address').value.trim() }); await refreshStatus(); await refreshPrinters(); message('IPP 服务已启动。');
@@ -177,6 +193,9 @@ $('device-form').addEventListener('submit', (event) => { event.preventDefault();
   event.target.reset(); await refreshDevices();
 }); });
 window.addEventListener('pagehide', hideSecret);
+setInterval(() => {
+  if (window.__TAURI__ && !$('connections').hidden) action(refreshConnections);
+}, 2000);
 if (window.__TAURI__) action(async () => {
   await window.__TAURI__.event.listen('hide-secret', hideSecret);
   await window.__TAURI__.event.listen('exit-blocked', async ({ payload }) => { hideSecret(); message(payload, true); await refreshStatus(); });

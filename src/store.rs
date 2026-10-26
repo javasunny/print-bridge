@@ -5,6 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -70,6 +71,17 @@ pub struct Job {
     pub detail: String,
     pub created_at: i64,
 }
+#[derive(Clone, Debug, Serialize)]
+pub struct ConnectionEvent {
+    pub timestamp: i64,
+    pub client_ip: Option<String>,
+    pub method: String,
+    pub path: String,
+    pub operation: Option<u16>,
+    pub http_status: u16,
+    pub ipp_status: Option<u16>,
+    pub detail: String,
+}
 #[derive(Serialize)]
 pub struct ServiceStatus {
     pub running: bool,
@@ -84,6 +96,7 @@ pub struct Bridge {
     sumatra: PathBuf,
     pub(crate) running: AtomicBool,
     authentication_required: AtomicBool,
+    connection_events: Mutex<VecDeque<ConnectionEvent>>,
     service: Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>,
     worker_active: AtomicBool,
     server_active: AtomicBool,
@@ -130,6 +143,7 @@ impl Bridge {
             sumatra,
             running: AtomicBool::new(false),
             authentication_required: AtomicBool::new(authentication_required),
+            connection_events: Mutex::new(VecDeque::new()),
             service: Mutex::new(None),
             worker_active: AtomicBool::new(false),
             server_active: AtomicBool::new(false),
@@ -432,6 +446,22 @@ impl Bridge {
             authentication_required: self.authentication_required(),
         }
     }
+    pub fn connection_events(&self) -> Vec<ConnectionEvent> {
+        self.connection_events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    }
+    pub(crate) fn record_connection_event(&self, event: ConnectionEvent) {
+        let mut events = self.connection_events.lock().unwrap();
+        if events.len() == 100 {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
     pub fn start(self: &Arc<Self>, addr: &str) -> Result<()> {
         let mut service = self.service.lock().unwrap();
         if service.is_some()
@@ -462,11 +492,15 @@ impl Bridge {
             runtime.block_on(async move {
                 let listener =
                     tokio::net::TcpListener::from_std(listener).expect("configured listener");
-                let _ = axum::serve(listener, crate::service::router(Arc::clone(&bridge)))
-                    .with_graceful_shutdown(async {
-                        let _ = rx.await;
-                    })
-                    .await;
+                let _ = axum::serve(
+                    listener,
+                    crate::service::router(Arc::clone(&bridge))
+                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await;
                 bridge.running.store(false, Ordering::SeqCst);
                 bridge.server_active.store(false, Ordering::SeqCst);
             })
@@ -719,6 +753,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn connection_history_keeps_latest_100_in_newest_first_order() {
+        let (_directory, bridge, _) = fixture();
+        for timestamp in 0..105 {
+            bridge.record_connection_event(ConnectionEvent {
+                timestamp,
+                client_ip: None,
+                method: "POST".into(),
+                path: "/ipp/printers/office".into(),
+                operation: Some(crate::ipp::GET_PRINTER_ATTRIBUTES),
+                http_status: 200,
+                ipp_status: Some(0),
+                detail: "Capability query".into(),
+            });
+        }
+        let events = bridge.connection_events();
+        assert_eq!(events.len(), 100);
+        assert_eq!(events.first().unwrap().timestamp, 104);
+        assert_eq!(events.last().unwrap().timestamp, 5);
+    }
+
+    #[test]
     fn recovery_never_replays_processing_jobs_and_preserves_pending_jobs() {
         let (directory, bridge, device) = fixture();
         let processing = submit(&bridge, &device);
@@ -957,6 +1012,11 @@ mod network_tests {
         let message = parse(&response[offset..]).unwrap();
         assert_eq!(message.code, SUCCESSFUL_OK);
         assert_eq!(message.request_id, 42);
+        let events = bridge.connection_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].client_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(events[0].operation, Some(PRINT_JOB));
+        assert_eq!(events[0].ipp_status, Some(SUCCESSFUL_OK));
         let id = message.attribute("job-id").unwrap().as_i32().unwrap() as i64;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while bridge.job(id).unwrap().state != "simulated" && std::time::Instant::now() < deadline {

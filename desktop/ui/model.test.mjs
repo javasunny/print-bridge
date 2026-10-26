@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { canCancel, printerUrl, printerFromForm, stateLabel } from './model.mjs';
+import { canCancel, printerUrl, printerFromForm, stateLabel, connectionResult } from './model.mjs';
 
 test('only pending jobs expose cancellation', () => {
   assert.equal(canCancel({ state: 'pending' }), true);
@@ -20,4 +20,10 @@ test('unchecked capability does not become enabled through a string cast', () =>
 test('submitted state never claims physical completion', () => {
   assert.equal(stateLabel('submitted'), '已提交');
   assert.equal(stateLabel('uncertain'), '待核查');
+});
+test('connection diagnostics distinguish capability probes, accepted jobs and IPP errors within HTTP 200', () => {
+  assert.deepEqual(connectionResult({ http_status: 200, ipp_status: 0, operation: 11 }), { failed: false, label: '已连接' });
+  assert.deepEqual(connectionResult({ http_status: 200, ipp_status: 0, operation: 2 }), { failed: false, label: '任务已接收' });
+  assert.deepEqual(connectionResult({ http_status: 200, ipp_status: 0x040b, operation: 2 }), { failed: true, label: '请求被拒绝' });
+  assert.deepEqual(connectionResult({ http_status: 401, ipp_status: null, operation: null }), { failed: true, label: '请求被拒绝' });
 });

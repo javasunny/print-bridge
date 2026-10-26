@@ -237,6 +237,75 @@ mod tests {
     }
 
     #[test]
+    fn late_queries_are_answered_after_startup_announcements_without_reregistering() {
+        use std::net::{Ipv4Addr, UdpSocket};
+        use std::time::Instant;
+
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let daemon = ServiceDaemon::new_with_port(port).unwrap();
+        let p = printer();
+        let mut info = service_info(&p, "127.0.0.1:8631".parse().unwrap(), false).unwrap();
+        info.set_interfaces(vec![IfKind::LoopbackV4]);
+        let _cleanup = Discovery {
+            names: vec![info.get_fullname().to_owned()],
+            daemon: Some(daemon.clone()),
+            error: Arc::new(Mutex::new(None)),
+            announced: Arc::new(AtomicBool::new(false)),
+        };
+        daemon.register(info).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let metrics = daemon
+                .get_metrics()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            if metrics.get("register-resend").copied().unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup announcements did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for name in ["_ipp._tcp.local.", SERVICE_TYPE] {
+            // Create the client only after both startup announcements: it cannot
+            // discover this queue from cached or unsolicited startup packets.
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut query = vec![0x43, 0x50, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            for label in name.trim_end_matches('.').split('.') {
+                query.push(label.len() as u8);
+                query.extend_from_slice(label.as_bytes());
+            }
+            query.extend_from_slice(&[0, 0, 12, 0, 1]);
+            client.send_to(&query, (Ipv4Addr::LOCALHOST, port)).unwrap();
+            let mut buffer = [0; 9000];
+            let (size, source) = client.recv_from(&mut buffer).unwrap();
+            assert_eq!(source.port(), port);
+            assert_eq!(&buffer[..2], &[0x43, 0x50]);
+            assert_ne!(buffer[2] & 0x80, 0);
+            assert!(buffer[..size]
+                .windows(b"rp=ipp/printers/office".len())
+                .any(|value| value == b"rp=ipp/printers/office"));
+        }
+        let metrics = daemon
+            .get_metrics()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(metrics.get("register"), Some(&1));
+        assert!(metrics.get("respond").copied().unwrap_or(0) >= 2);
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     #[ignore = "Publishes a temporary Bonjour service on the LAN and uses the native macOS browser"]
     fn native_bonjour_finds_and_withdraws_airprint_service() {

@@ -34,6 +34,10 @@ Windows 服务更新后的联机只读查询确认 PDF/A4 能力正常，但 mac
 
 89 项 Rust 核心测试、3 项文档测试、4 项 macOS 常规测试和 9 项前端测试通过。真实 cupsfilter 输出的 URF/PWG Raster 经 HTTP 接收、转换、落盘与模拟调度后，各生成一页有效 PDF。显式执行的 macOS 无手工 PPD 队列测试使用 lpadmin -m everywhere 和默认 CUPS 选项，验证 3 份、Letter、短边双面；原生 ippfind 验证 AirPrint 子类型发现与停止后的注销。临时队列与广播均已清理；未向实体打印机出纸，iPhone/iPad、认证及 Windows 实际效果仍待联机验收。桌面构建及 Windows x64 0.1.6 EXE、NSIS 安装包交叉构建通过。使用步骤见 [AirPrint 说明](airprint.md)。
 
+## Bonjour 防火墙联机验证
+
+2026-10-26：客户端能连接 Windows TCP 8631，但入站 UDP 5353 查询无应答，表现为只有服务重启时的主动公告能让 Apple 设备发现队列。用户在管理员 PowerShell 执行 `scripts/enable-airprint-discovery.ps1` 后确认界面自动发现恢复正常。本机后续 `ippfind` 仍无队列输出，因此本次联机恢复记录依据用户界面反馈，不宣称命令行联机验证通过。本次不修改打印协议或增加定时广播，0.1.6 安装包继续使用；晚加入客户端查询回归测试验证无需重新注册服务即可响应新查询。
+
 ## 首次下载打印组件
 
 安装应用后，打开“设置 → 下载打印组件”。应用检查官方稳定版并从 SumatraPDF 官方 HTTPS 域下载 x64 portable ZIP。3.6.1 核对锁定的 ZIP/EXE SHA-256；后续稳定版在 Windows 验证有效 Authenticode 签名、预期发布者及产品版本，再记录本地摘要。不会自动下载或自动执行打印。

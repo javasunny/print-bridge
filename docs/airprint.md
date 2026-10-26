@@ -16,6 +16,8 @@ Print Bridge 提供实验性的 AirPrint / IPP Everywhere 接入能力。Apple �
 
 ## 只有重启服务才会被发现
 
+2026-10-26 联机验证：打印 TCP 8631 可达，但 Bonjour 基础 IPP 和 AirPrint 子类型查询均无应答。用户在 Windows 管理员 PowerShell 执行下述脚本后确认界面自动发现恢复正常，支持本次故障由发现流量的入站防火墙配置引起的判断。现有 0.1.6 无需更新安装包。本机 `ippfind` 后续复测仍未返回队列，未将命令行联机检查记为通过；恢复结果以用户界面反馈为依据。
+
 TCP 8631 可连接，不代表 Bonjour 的入站 UDP 5353 已放行。服务重启时主动发出的公告可以被 Apple 设备收到；若随后客户端查询被 Windows 防火墙阻止，就会出现“发现界面打开后，必须重启 Windows 服务才出现”的现象。先检查 Windows 当前网络属于“专用”，再放行发现查询；不要通过关闭整个防火墙或周期性重启服务处理。
 
 保持 Windows Print Bridge 服务运行，将 [enable-airprint-discovery.ps1](../scripts/enable-airprint-discovery.ps1) 复制到 Windows，在**管理员 PowerShell** 中进入脚本目录并执行：
@@ -26,7 +28,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\enable-airprint-discov
 
 自定义监听端口时追加 `-ListenPort 你的端口`。脚本从该监听端口查找正在运行的 Print Bridge 可执行文件，只为该程序建立“Private + LocalSubnet + 入站 UDP 5353”规则；重复运行会更新同一规则，不改变网络类别，也不开放 Public 或 Domain 网络。脚本需要管理员权限，因为 Windows 防火墙规则修改受系统权限控制。安装包和应用仍不会自动修改防火墙。
 
-执行后保持服务运行，在 Mac/iPhone/iPad 重新打开打印机选择界面验证，通常无需重启服务。若仍无法发现，需继续检查显式阻止规则、安全软件或网络对组播的限制；当前环境为 macOS，脚本对 Windows 防火墙的实际修改仍需在 Windows 执行。可用以下命令撤销脚本创建的规则：
+执行后保持服务运行，在 Mac/iPhone/iPad 重新打开打印机选择界面验证，通常无需重启服务。若仍无法发现，需继续检查显式阻止规则、安全软件或网络对组播的限制。可用以下命令撤销脚本创建的规则：
 
 ```powershell
 Remove-NetFirewallRule -Name PrintBridge-AirPrint-mDNS

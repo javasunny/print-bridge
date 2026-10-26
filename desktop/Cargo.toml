@@ -1,8 +1,11 @@
 [package]
 name = "print-bridge-desktop"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 publish = false
+license = "MIT"
+repository = "https://github.com/javasunny/print-bridge"
+description = "Print Bridge desktop application for Windows"
 
 [dependencies]
 print-bridge = { path = ".." }

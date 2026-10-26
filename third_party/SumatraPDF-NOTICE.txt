@@ -1,16 +1,24 @@
-SumatraPDF 3.6.1 x64 portable
+SumatraPDF x64 portable (pinned fallback: 3.6.1; later official stable releases supported)
 Copyright the SumatraPDF authors and contributing third-party projects.
 Project: https://github.com/sumatrapdfreader/sumatrapdf
 Release source: tag 3.6.1rel
 
 Print Bridge does not bundle or redistribute SumatraPDF binaries. On the user's
 explicit request in Settings, the app downloads the unmodified portable release
-directly from https://www.sumatrapdfreader.org and verifies pinned SHA-256 values.
+directly from https://www.sumatrapdfreader.org. Version 3.6.1 uses pinned ZIP/EXE
+SHA-256 values. Later stable releases require Windows Authenticode publisher and
+version validation before their local executable digest is saved.
 It then invokes that executable as a separate process for printing.
 
 Upstream license and source are available from the project and release tag:
 https://github.com/sumatrapdfreader/sumatrapdf/blob/3.6.1rel/COPYING
 https://github.com/sumatrapdfreader/sumatrapdf/tree/3.6.1rel
+
+SumatraPDF is licensed under GPLv3, with additional third-party licenses as
+documented upstream. For a newer downloaded version, consult the COPYING file
+and corresponding release source for that exact version:
+https://github.com/sumatrapdfreader/sumatrapdf/releases
+Its licensing is independent of the MIT license of Print Bridge's own code.
 
 This download-only distribution model replaces the former bundled resource
 workflow. If binaries are bundled in a future release, revisit the applicable

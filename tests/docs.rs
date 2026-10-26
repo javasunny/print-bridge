@@ -2,7 +2,12 @@ use std::{fs, path::PathBuf};
 
 fn documents() -> Vec<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut paths = vec![root.join("README.md"), root.join("desktop/README.md")];
+    let mut paths = vec![
+        root.join("README.md"),
+        root.join("desktop/README.md"),
+        root.join("CONTRIBUTING.md"),
+        root.join("CHANGELOG.md"),
+    ];
     paths.extend(
         fs::read_dir(root.join("docs"))
             .unwrap()
@@ -77,4 +82,53 @@ fn local_document_links_exist() {
             }
         }
     }
+}
+
+#[test]
+fn release_version_matches_manifests_readme_and_changelog() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("desktop/tauri.conf.json")).unwrap())
+            .unwrap();
+    let version = config["version"].as_str().unwrap();
+    let manifest = fs::read_to_string(root.join("desktop/Cargo.toml")).unwrap();
+    assert!(manifest.contains(&format!("version = \"{version}\"")));
+    let lock = fs::read_to_string(root.join("desktop/Cargo.lock")).unwrap();
+    assert!(lock.contains(&format!(
+        "name = \"print-bridge-desktop\"\nversion = \"{version}\""
+    )));
+    let readme = fs::read_to_string(root.join("README.md")).unwrap();
+    assert!(readme.contains(&format!("Print-Bridge_{version}_x64-setup.exe")));
+    let changelog = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(changelog.contains(&format!("## {version} —")));
+}
+
+#[test]
+fn license_material_is_present_in_the_installer_resources() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.join("desktop/tauri.conf.json")).unwrap())
+            .unwrap();
+    let resources = config["bundle"]["resources"].as_object().unwrap();
+    for name in [
+        "LICENSE",
+        "THIRD_PARTY_LICENSES.txt",
+        "SumatraPDF-NOTICE.txt",
+    ] {
+        let (source, _) = resources
+            .iter()
+            .find(|(_, target)| target.as_str() == Some(name))
+            .unwrap_or_else(|| panic!("Missing installer license: {name}"));
+        assert!(root.join("desktop").join(source).is_file());
+    }
+    let license = fs::read_to_string(root.join("LICENSE")).unwrap();
+    assert!(license.starts_with("MIT License\n"));
+    for path in ["Cargo.toml", "desktop/Cargo.toml"] {
+        assert!(fs::read_to_string(root.join(path))
+            .unwrap()
+            .contains("license = \"MIT\""));
+    }
+    let notices = fs::read_to_string(root.join("THIRD_PARTY_LICENSES.txt")).unwrap();
+    assert!(notices.contains("MPL-2.0"));
+    assert!(notices.contains("https://crates.io/api/v1/crates/"));
 }

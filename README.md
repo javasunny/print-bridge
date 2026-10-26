@@ -1,76 +1,156 @@
 # Print Bridge
 
-Windows 多打印机 IPP 桥接工具，使用 Tauri 和 Rust。Mac、iPhone 和 iPad 可通过实验性 AirPrint 自动发现共享队列，提交的 PDF、JPEG、URF 或 PWG Raster 统一为 PDF 后，由 Windows 端使用 SumatraPDF 调用指定打印队列。首次使用时在设置中手动下载打印组件。
+让 Mac、iPhone 和 iPad 使用 Windows 电脑上已安装的打印机。
 
-当前为开发版本，已在 macOS 上交叉构建 Windows x64 EXE 和 NSIS 安装包。用户已验证 macOS 通过 Windows 首次真实打印成功；设备认证和多队列等场景仍需继续实机验收。
+A local IPP print bridge for Windows, with experimental AirPrint discovery for Apple devices. Built with Rust and Tauri.
 
-## 已实现
+[![Release](https://img.shields.io/github/v/release/javasunny/print-bridge?include_prereleases)](https://github.com/javasunny/print-bridge/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Windows x64](https://img.shields.io/badge/platform-Windows%20x64-blue.svg)](https://github.com/javasunny/print-bridge/releases)
 
-- 本地桌面管理：共享打印机、手动能力配置、设备凭据、任务列表、服务启停及托盘。
-- IPP 1.1/2.0，支持 Print-Job 和 Create-Job/Send-Document 单文档流程；打印机能力可匿名查询，默认使用 HTTP Basic 设备令牌认证。可在设置中关闭认证，先测试免认证打印流程。
-- PDF 结构、加密、页数及大小检查；A3、A4、A5、A6、Letter、Legal、Tabloid，1–99 份及能力允许的单面、长边双面、短边双面。
-- SQLite 与 PDF 持久化、全局串行调度、等待任务取消；重启后处理中任务进入待核查。
-- 打印目标固定，不回退到默认打印机；超时或非零退出不会自动重打。
-- 设置中检查 SumatraPDF 官方稳定版并手动下载或更新；锁定版核对 SHA-256，新版在 Windows 校验发布者签名和版本，失败保留旧组件。
-- 模拟与正式数据隔离，单实例文件锁，上传并发与任务容量限制，终态 PDF 超期清理。
-- 每台打印机独立配置已验证的纸张、默认纸张和双面能力，并提供匹配配置的 macOS PPD 下载地址。旧配置与历史任务保持 A4 默认值。
-- 连接诊断：显示来源 IP、请求时间、IPP 操作和处理结果，包含尚未进入任务列表的查询与拒绝请求。
+> 当前为早期开发版本。已有 macOS → Windows 真实打印及自动发现恢复的用户验证记录；iPhone/iPad 实际出纸、设备认证和多队列等完整兼容性仍待实机验证。项目没有取得 Apple AirPrint 或 PWG IPP Everywhere 认证。
 
-- Bonjour 自动发现每个共享队列，声明纸张、双面、300 dpi 灰度/sRGB 栅格能力；Mac 无需手动 PPD。详情与验收边界见 [AirPrint 说明](docs/airprint.md)。
+## 功能
 
-## 运行
+- **共享多台打印机**：绑定 Windows 队列，为每台打印机提供独立的 IPP 地址和 Bonjour 广播。
+- **Apple 设备接入**：实验性 AirPrint 自动发现；Mac 可通过 IPP 地址和队列专属 PPD 手动添加。
+- **文档与打印选项**：支持 PDF、JPEG、300 dpi 灰度/sRGB URF 与 PWG Raster；按队列配置纸张、默认纸张、份数及双面能力。客户端显式彩色/黑白选项传递给 Windows 驱动。
+- **本地任务管理**：SQLite 持久化、全局串行调度、等待任务取消；异常结果进入“待核查”，不自动重打。
+- **设备凭据**：默认启用设备令牌认证，可在可信局域网中手动关闭；完整令牌只显示一次，服务端仅保存哈希。
+- **记录与诊断**：按打印机筛选任务，查看连接来源及拒绝原因；支持清除已结束打印记录和诊断记录。
+- **桌面与托盘**：本地管理界面、服务启停、SumatraPDF 手动下载和更新；关闭窗口后继续在托盘运行。
 
-用户直接安装 Windows 安装包。启动后打开“设置 → 下载打印组件”，下载完成后配置共享打印机和设备凭据。
+## 下载与安装
 
-本机构建产物位于 `dist`：推荐安装 `Print Bridge_0.1.6_x64-setup.exe`，安装程序按需下载 WebView2；独立应用 `Print-Bridge-Windows-x64.exe` 要求系统已有 WebView2。两个文件均未签名。
+前往 [GitHub Releases](https://github.com/javasunny/print-bridge/releases) 下载编译好的文件，无需安装 Rust 或自行构建。
 
-从源码运行时，Windows 开发环境需要 Rust MSVC 工具链、Visual Studio C++ 构建工具和 WebView2：
+| 文件 | 用途 |
+|---|---|
+| `Print-Bridge_0.1.7_x64-setup.exe` | 推荐：Windows x64 安装包，按需安装 WebView2 |
+| `Print-Bridge-Windows-x64.exe` | 独立程序，需要系统已有 Microsoft Edge WebView2 Runtime |
+| `SHA256SUMS.txt` | 发布文件的 SHA-256 校验值 |
+| `LICENSE`、`THIRD_PARTY_LICENSES.txt` | 项目及第三方依赖许可证，安装包也包含这些文件 |
+
+运行目标为 **Windows 11 x64**，需提前安装打印机驱动，并确认 Windows 本机能够正常打印。其他 Windows 版本及 ARM64 尚未验收；macOS 仅支持开发模拟模式。
+
+安装包尚未进行代码签名，Windows 可能显示 SmartScreen 或发布者提示。仅从本仓库 Release 下载，并可在 PowerShell 中核对摘要：
+
+```powershell
+Get-FileHash .\Print-Bridge_0.1.7_x64-setup.exe -Algorithm SHA256
+```
+
+首次下载打印组件和安装缺失的 WebView2 需要联网。完成准备后，打印通过局域网进行，不依赖云端打印服务。
+
+## 快速开始
+
+### 1. 配置 Windows
+
+1. 安装并打开 Print Bridge，在“设置”中点击“下载组件”，等待 SumatraPDF 下载和校验完成。
+2. 在“共享打印机”中填写桥接 ID、显示名称，选择 Windows 队列并保存。纸张、默认纸张和双面能力应与已验证的驱动能力一致。
+3. 默认要求设备认证：在“设备凭据”创建凭据并保存设备 ID 与令牌。首次测试也可在“设置”关闭认证；运行中更改需重启服务。
+4. 确认监听地址为 Windows 的局域网 IPv4，默认端口为 `8631`，点击“启动服务”。
+5. Windows 网络应设为“专用”；在防火墙中仅对可信私有局域网放行服务 TCP 端口及 mDNS UDP `5353`。应用不会自动修改防火墙。发现异常时参阅 [AirPrint 排障与防火墙脚本](docs/airprint.md#只有重启服务才会被发现)。
+
+### 2. 添加 Apple 设备
+
+- **Mac**：打开“系统设置 → 打印机与扫描仪 → 添加”，在默认列表选择共享名称，Use 选择 AirPrint。
+- **iPhone / iPad**：与 Windows 连接同一局域网，在应用的“打印 → 选择打印机”中选择共享名称。这些设备的完整联机兼容性仍待验收。
+- **认证开启时**：用户名填设备 ID，密码填令牌。不要把凭据写入打印机 URL。
+
+如果自动发现不可用，Mac 可以手动填写 IPP 地址，例如 `ipp://192.168.1.10:8631/ipp/printers/office`。界面提供独立的 Address、Protocol、Queue 和 PPD 下载地址，详见 [桌面使用说明](desktop/README.md)。
+
+### 3. 查看任务与诊断
+
+“打印任务”和“连接诊断”在打开对应页时每 2 秒刷新。“已提交”只表示已交给 Windows，不代表确认出纸。
+
+- 等待任务可以取消；待核查任务请检查 Windows 队列和实际出纸情况。
+- 打印任务的“清除记录”删除**全部打印机**的已结束记录及对应缓存文档，不受当前筛选影响；等待、处理中和待核查任务保留。
+- 诊断页保留本次运行最近 100 条请求；清除后继续记录新请求。任务界面显示最近 1000 条记录。
+- 关闭窗口后服务继续在系统托盘运行；通过托盘菜单停止服务并退出。
+
+## 工作原理
+
+```text
+Mac / iPhone / iPad
+    │ IPP · PDF / JPEG / URF / PWG Raster
+    ▼
+Rust IPP 服务 → 格式校验与 PDF 转换 → SQLite + 文档存储
+    │ 全局串行任务调度
+    ▼
+SumatraPDF 独立进程 → 指定 Windows 驱动与队列 → 打印机
+
+Tauri 桌面界面 ── 本地命令 ── 配置、凭据、任务与诊断
+```
+
+实体打印机本身无需具备 AirPrint 能力。能力由本地手动配置；项目不会自动安装驱动，也不会把失败任务改投默认打印机。
+
+## 安全与限制
+
+- 仅用于**可信局域网**。当前使用 HTTP IPP 和 Basic 认证，不支持 IPPS；凭据和打印文档没有传输加密，不应暴露到公网。
+- 关闭认证后，能连接服务的局域网客户端均可提交任务，且共用匿名任务身份。
+- 不支持多文档任务、PostScript、任意栅格编码、纸盒或装订。没有登录启动、应用自动升级或待核查任务人工归档功能。
+- 没有跨连接的可靠重试去重。主动重复提交及客户端网络重试可能创建独立任务；应用自身不会自动重试打印调用。
+- 输入及转换后的 PDF 最多 100 MiB、500 页；有栅格解码、上传并发、任务数量和磁盘配额限制。PDF 解析尚无独立进程资源隔离，请勿接收不可信文档。
+- 终态 PDF 保留 24 小时后清理，任务元数据不按天自动删除；等待、处理中和待核查文档保留。主动清除已结束记录会同时删除对应文档。
+- 数据位于 Tauri 用户应用数据目录的 `production` / `simulation` 子目录；SumatraPDF 位于同一根目录的 `tools/sumatra`。应用升级不会主动清除这些数据。
+
+## 从源码开发
+
+Windows 需要 Rust MSVC 工具链、Visual Studio C++ Build Tools 和 WebView2。界面为原生 JavaScript 静态资源，无需 npm 安装或前端构建。
 
 ```sh
+git clone https://github.com/javasunny/print-bridge.git
+cd print-bridge
 cargo run --manifest-path desktop/Cargo.toml --locked
 ```
 
-macOS 开发机可以运行模拟桌面，所有任务只记录模拟完成：
+macOS 仅用于模拟开发，不执行真实打印：
 
 ```sh
 cargo run --manifest-path desktop/Cargo.toml --locked -- --simulate
 ```
 
-先保存至少一台共享打印机，再创建设备凭据。设备标识作为用户名，令牌作为密码。令牌只展示一次，服务端仅存哈希；不要将凭据写进打印机 URL。
+在 Windows 使用 Tauri CLI 2 打包：
 
-需要先跑通免认证流程时，在“设置”取消勾选“要求设备认证”，更改立即保存；若服务正在运行，界面会提醒重启服务后生效。该设置在应用重启后保留；关闭期间连接到服务的局域网设备均可打印，匿名任务共用一个身份。恢复认证同样勾选后重启服务。撤销凭据会删除该凭据，历史打印任务仍保留。
+```sh
+cd desktop
+cargo tauri build --bundles nsis -- --locked
+```
 
-“打印任务”和“连接诊断”采用横向表格，在打开对应页时每 2 秒自动刷新；诊断保留最近 100 条请求，关闭程序后清空。Mac 可使用 [只读 IPP 探测](macos/check-ipp-connection.test)验证连通性，操作说明见 [桌面说明](desktop/README.md#连接诊断)。探测不会创建打印任务；只有 Print-Job 成功才表示 PDF 已进入桥接任务列表。
+macOS 交叉构建 Windows 安装包使用 `bash scripts/build-windows.sh`。工具准备、产物说明和发布步骤见 [桌面构建说明](desktop/README.md#在-macos-构建-windows-x64) 与 [发布指南](docs/RELEASING.md)。
 
-启动界面自动填入本机局域网 IPv4 和端口 `8631`，可手动修改；检测失败时提示手动填写。共享打印机按 macOS 的 Address、Protocol、Queue 分开显示并支持复制。仅为私有网络配置 Windows 防火墙。当前 HTTP 不加密凭据与 PDF，只适用于可信局域网。
+### 测试
 
-详细操作和打包见 [桌面说明](desktop/README.md)，真实设备验收见 [Windows 验证清单](docs/windows-validation.md)，需求见 [PRD](docs/PRD.md)。
-
-## 自动化验证
-
-在仓库根目录执行：
+Node.js 用于前端测试，Rust 测试不执行真实打印：
 
 ```sh
 cargo test --locked
 cargo fmt --check
-node --test desktop/ui/model.test.mjs
+node --test desktop/ui/*.test.mjs
 node --check desktop/ui/app.js
 cargo fmt --manifest-path desktop/Cargo.toml --check
-cargo build --manifest-path desktop/Cargo.toml --locked
+cargo check --manifest-path desktop/Cargo.toml --locked
 ```
 
-Rust 测试包括监听 `127.0.0.1` 随机端口的分块 HTTP/IPP 模拟测试；受限环境需允许本机端口绑定。所有自动测试均不执行真实打印。
+部分测试需要绑定本机 TCP/UDP 端口。下载组件、创建系统临时打印队列和原生 Bonjour 测试默认忽略，须按说明单独运行；模拟测试不代表实体打印验收通过。
 
-## 当前边界
+## 文档
 
-- 用户已通过旧版本 macOS 原生队列验证首次免认证 PDF 打印；新增无驱动接入、Basic 凭据保存和 iPhone/iPad 实际出纸仍需联机验证，不宣称已经取得 AirPrint 或 IPP Everywhere 认证。
-- 不支持多文档任务；栅格只接受所声明的格式及分辨率，未支持的编码或打印选项会被拒绝。
-- 暂无可靠的跨连接幂等标识，因此主动重复提交会创建独立任务，网络重试也可能重复。应用自身不会自动重试打印调用。
-- 待核查任务保留文件并提示人工检查；当前没有人工归档操作。界面显示最近 1000 条任务。
-- PDF 检查已有输入大小和页数上限，但还没有独立进程的解析超时与内存隔离。不要向开发版本提交不可信 PDF。
-- 暂无 IPPS、登录启动、自动升级或签名安装包。多打印机先全局串行执行；自动发现需要私有网络放行 UDP 5353。
-- 能力由本地手动配置，应先在 Windows 驱动中验证。桌面界面不另设颜色控件；客户端显式彩色/黑白选项会传给 Windows 驱动，auto 沿用驱动默认值。
+- [桌面使用、组件与构建](desktop/README.md)
+- [当前设计与实现边界](docs/PRD.md)
+- [AirPrint 接入与排障](docs/airprint.md)
+- [Windows 实机验证记录与清单](docs/windows-validation.md)
+- [发布指南](docs/RELEASING.md)
+- [更新日志](CHANGELOG.md)
 
-终态 PDF 保留 24 小时；等待、处理中和待核查的文件不自动删除。数据放在 Tauri 用户应用数据目录的 `production` 或 `simulation` 子目录。
+## 反馈与贡献
 
-SumatraPDF 组件保存在同一应用数据根目录下的 `tools/sumatra`。安装包不包含该第三方可执行程序；仅在用户点击按钮后从官方网站下载。项目构建与测试均不依赖 Python。
+欢迎提交 [Issue](https://github.com/javasunny/print-bridge/issues) 或 Pull Request。报告问题时请提供应用版本、Windows / Apple 系统版本、打印机与驱动、认证模式及已脱敏的诊断结果，不要上传令牌或打印文档。
+
+提交代码前运行相关测试及格式检查。涉及打印行为的更改应补充回归测试；请明确区分模拟结果与真实设备验证，具体要求见 [贡献指南](CONTRIBUTING.md)。
+
+## 开源协议与第三方软件
+
+Print Bridge 自身代码使用 [MIT License](LICENSE)，允许使用、修改、分发和商用，需保留版权和许可证声明。第三方依赖沿用各自许可证，详见 [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt)。
+
+SumatraPDF 为独立的第三方项目，**不随源码仓库或安装包分发**；用户在设置中主动从官方网站下载，应用通过独立进程调用。其许可证与源码入口见 [SumatraPDF 声明](third_party/SumatraPDF-NOTICE.txt)。

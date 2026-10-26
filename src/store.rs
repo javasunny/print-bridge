@@ -88,6 +88,8 @@ pub struct ServiceStatus {
     pub simulation: bool,
     pub address: Option<String>,
     pub authentication_required: bool,
+    pub active_authentication_required: bool,
+    pub authentication_restart_required: bool,
 }
 pub struct Bridge {
     pub(crate) db: Mutex<Connection>,
@@ -96,6 +98,7 @@ pub struct Bridge {
     sumatra: PathBuf,
     pub(crate) running: AtomicBool,
     authentication_required: AtomicBool,
+    configured_authentication_required: AtomicBool,
     connection_events: Mutex<VecDeque<ConnectionEvent>>,
     service: Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>,
     worker_active: AtomicBool,
@@ -127,6 +130,8 @@ impl Bridge {
             CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,printer_id TEXT NOT NULL,queue TEXT NOT NULL,copies INTEGER NOT NULL,sides TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,file TEXT NOT NULL,digest TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state,id);").map_err(err)?;
         db.execute("UPDATE jobs SET state='uncertain',detail='应用退出前正在调用打印程序，请检查 Windows 队列及出纸情况',updated_at=? WHERE state='processing'", [now()]).map_err(err)?;
+        db.execute("DELETE FROM devices WHERE revoked=1", [])
+            .map_err(err)?;
         let authentication_required = db
             .query_row(
                 "SELECT value FROM settings WHERE key='authentication_required'",
@@ -143,6 +148,7 @@ impl Bridge {
             sumatra,
             running: AtomicBool::new(false),
             authentication_required: AtomicBool::new(authentication_required),
+            configured_authentication_required: AtomicBool::new(authentication_required),
             connection_events: Mutex::new(VecDeque::new()),
             service: Mutex::new(None),
             worker_active: AtomicBool::new(false),
@@ -252,7 +258,7 @@ impl Bridge {
     pub fn list_devices(&self) -> Result<Vec<Device>> {
         let db = self.db.lock().unwrap();
         let mut stmt = db
-            .prepare("SELECT id,name,revoked FROM devices ORDER BY name")
+            .prepare("SELECT id,name,revoked FROM devices WHERE revoked=0 ORDER BY name")
             .map_err(err)?;
         let result = stmt
             .query_map([], |r| {
@@ -271,7 +277,7 @@ impl Bridge {
         self.db
             .lock()
             .unwrap()
-            .execute("UPDATE devices SET revoked=1 WHERE id=?", [id])
+            .execute("DELETE FROM devices WHERE id=?", [id])
             .map_err(err)?;
         Ok(())
     }
@@ -295,12 +301,13 @@ impl Bridge {
     }
     pub fn set_authentication_required(&self, required: bool) -> Result<()> {
         let _service = self.service.lock().unwrap();
-        if self.running.load(Ordering::SeqCst) {
-            return Err("请先停止服务，再修改认证设置".into());
-        }
         self.db.lock().unwrap().execute("INSERT INTO settings(key,value) VALUES('authentication_required',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [required]).map_err(err)?;
-        self.authentication_required
+        self.configured_authentication_required
             .store(required, Ordering::SeqCst);
+        if !self.running.load(Ordering::SeqCst) {
+            self.authentication_required
+                .store(required, Ordering::SeqCst);
+        }
         Ok(())
     }
     pub fn list_jobs(&self) -> Result<Vec<Job>> {
@@ -443,7 +450,15 @@ impl Bridge {
             running: self.running.load(Ordering::SeqCst),
             simulation: self.simulation,
             address: self.service.lock().unwrap().as_ref().map(|x| x.0.clone()),
-            authentication_required: self.authentication_required(),
+            authentication_required: self
+                .configured_authentication_required
+                .load(Ordering::SeqCst),
+            active_authentication_required: self.authentication_required(),
+            authentication_restart_required: self.running.load(Ordering::SeqCst)
+                && self.authentication_required()
+                    != self
+                        .configured_authentication_required
+                        .load(Ordering::SeqCst),
         }
     }
     pub fn connection_events(&self) -> Vec<ConnectionEvent> {
@@ -485,6 +500,11 @@ impl Bridge {
             .map_err(err)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         *service = Some((bound, tx));
+        self.authentication_required.store(
+            self.configured_authentication_required
+                .load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         self.running.store(true, Ordering::SeqCst);
         self.server_active.store(true, Ordering::SeqCst);
         let bridge = Arc::clone(self);
@@ -746,10 +766,42 @@ pub(crate) mod tests {
         let bridge = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
         assert!(!bridge.status().authentication_required);
         bridge.running.store(true, Ordering::SeqCst);
-        assert!(bridge.set_authentication_required(true).is_err());
+        bridge.set_authentication_required(true).unwrap();
+        assert!(bridge.status().authentication_required);
+        assert!(!bridge.authentication_required());
+        assert!(bridge.status().authentication_restart_required);
         bridge.running.store(false, Ordering::SeqCst);
         bridge.set_authentication_required(true).unwrap();
         assert!(bridge.authentication_required());
+    }
+
+    #[test]
+    fn opening_store_removes_old_revoked_credentials_and_keeps_active_devices() {
+        let directory = tempfile::tempdir().unwrap();
+        let bridge = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+        let revoked = bridge.create_device("old Mac".into()).unwrap();
+        let active = bridge.create_device("current Mac".into()).unwrap();
+        bridge
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE devices SET revoked=1 WHERE id=?",
+                [&revoked.device.id],
+            )
+            .unwrap();
+        drop(bridge);
+        let bridge = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+        assert_eq!(bridge.list_devices().unwrap().len(), 1);
+        assert!(bridge.authenticate(&active.device.id, &active.token));
+        assert!(!bridge.authenticate(&revoked.device.id, &revoked.token));
+        let retained: i64 = bridge
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM devices", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, 1);
     }
 
     #[test]
@@ -872,6 +924,14 @@ pub(crate) mod tests {
         assert!(!bridge.authenticate(&device.device.id, "wrong-token"));
         let job = submit(&bridge, &device);
         bridge.revoke_device(&device.device.id).unwrap();
+        assert!(bridge.list_devices().unwrap().is_empty());
+        let retained: i64 = bridge
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM devices", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, 0);
         assert!(!bridge.authenticate(&device.device.id, &device.token));
         assert!(bridge
             .accept(&device.device.id, "office", 1, "one-sided", &pdf_bytes())
@@ -1023,6 +1083,9 @@ mod network_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(bridge.job(id).unwrap().state, "simulated");
+        bridge.set_authentication_required(false).unwrap();
+        assert!(bridge.authentication_required());
+        assert!(bridge.status().authentication_restart_required);
         bridge.stop().unwrap();
         while (bridge.worker_active.load(Ordering::SeqCst)
             || bridge.server_active.load(Ordering::SeqCst))
@@ -1031,6 +1094,8 @@ mod network_tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         bridge.start("127.0.0.1:0").unwrap();
+        assert!(!bridge.authentication_required());
+        assert!(!bridge.status().authentication_restart_required);
         bridge.stop().unwrap();
     }
 

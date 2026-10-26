@@ -10,17 +10,21 @@
 cargo run --manifest-path desktop/Cargo.toml --locked
 ```
 
-首次使用时在“设置”点击“下载打印组件”；从官方网站下载并校验 SumatraPDF 后即可使用。在“共享打印机”选择本机队列并保存；创建设备凭据后，设置 Windows 局域网监听地址，再启动服务。默认只监听 `127.0.0.1:8631`。
+首次使用时在“设置”点击“下载打印组件”；从官方网站下载并校验 SumatraPDF 后即可使用。在“共享打印机”选择本机队列并保存；需要认证时创建设备凭据，再启动服务。启动界面自动检测本机局域网 IPv4 并填入 `IP:8631`；可手动修改，检测失败时不会回退到回环地址。
 
-免认证测试：停止服务，在“设置”取消勾选“要求设备认证”后点击“保存认证设置”，再启动服务。Mac 无需设备 ID 或令牌；所有免认证任务共用匿名身份。该设置会保存，恢复认证时同样先停止服务再勾选保存。
+免认证测试：在“设置”取消勾选“要求设备认证”后自动保存。运行中修改会提醒重启服务，当前服务继续使用原认证策略。Mac 无需设备 ID 或令牌；所有免认证任务共用匿名身份。恢复认证同样勾选后重启服务。撤销设备会立即删除其凭据，不保留已撤销条目，历史任务仍保留。
 
-macOS 添加时，在“打印机与扫描仪 → 添加打印机 → IP”填写：Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。若 Auto Select 仍选 Generic PostScript Printer，在 Use 选择 Other，打开仓库内的 [Print-Bridge-PDF-A4-Simplex.ppd](../macos/Print-Bridge-PDF-A4-Simplex.ppd)，确认显示 `Print Bridge PDF A4 Single-Sided` 后添加。此配置用于 A4 单面队列，不提供双面选项；不含地址或凭据。认证开启时，打印任务使用设备 ID 和令牌。
+每台共享打印机分别显示并提供复制按钮：Address、Protocol、Queue。macOS 添加时，在“打印机与扫描仪 → 添加打印机 → IP”填写：Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。若 Auto Select 仍选 Generic PostScript Printer，在 Use 选择 Other，打开仓库内的 [Print-Bridge-PDF-A4-Simplex.ppd](../macos/Print-Bridge-PDF-A4-Simplex.ppd)，确认显示 `Print Bridge PDF A4 Single-Sided` 后添加。此配置用于 A4 单面队列，不提供双面选项；不含地址或凭据。认证开启时，打印任务使用设备 ID 和令牌。
 
 关闭窗口隐藏到系统托盘；在托盘选择“打开 Print Bridge”可恢复窗口。“停止服务并退出”先停止接收和领取任务，若仍有打印调用则拒绝退出并提示稍后重试，不强行终止打印。
 
+## 打印组件更新
+
+在“设置”点击“检查更新”，读取官方稳定版版本号；停止打印服务且当前调用完成后，可下载组件或更新。3.6.1 继续使用锁定的 ZIP/EXE SHA-256；其他稳定版在 Windows 验证有效 Authenticode 签名、预期发布者和产品版本，之后记录本地摘要供离线校验。下载或校验失败会保留旧组件，不自动执行打印。
+
 ## 连接诊断
 
-Windows 启动服务后打开“连接诊断”，可看到最近 100 条 HTTP/IPP 请求的来源 IP、时间、队列路径、操作、HTTP/IPP 状态和拒绝原因。此页每 2 秒刷新，记录只保留在本次运行的内存中，不记录令牌、请求头、文档标题或 PDF 内容。
+Windows 启动服务后打开“连接诊断”，可看到最近 100 条 HTTP/IPP 请求的来源 IP、时间、队列路径、操作、HTTP/IPP 状态和拒绝原因。连接诊断和打印任务使用横向表格，打开对应页时每 2 秒自动刷新。诊断记录只保留在本次运行的内存中，不记录令牌、请求头、文档标题或 PDF 内容。
 
 在 Mac 的仓库根目录执行以下只读探测，替换 Windows IP、端口和桥接 ID：
 

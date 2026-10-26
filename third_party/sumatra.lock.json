@@ -2,7 +2,7 @@
   "version": "3.6.1",
   "architecture": "x64",
   "binary": {
-    "url": "https://www.sumatrapdfreader.org/dl/rel/3.6.1/SumatraPDF-3.6.1-64.zip",
+    "url": "https://files.sumatrapdfreader.org/software/sumatrapdf/rel/3.6.1/SumatraPDF-3.6.1-64.zip",
     "sha256": "98b33a518d42986856d225064b0cd2d3643ecf78cbf84ab873d26cc51877a544",
     "member": "SumatraPDF-3.6.1-64.exe"
   },

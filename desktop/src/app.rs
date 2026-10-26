@@ -14,6 +14,12 @@ use tauri::{
 type Backend<'a> = State<'a, Arc<Bridge>>;
 
 #[tauri::command]
+async fn default_listen_address() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(print_bridge::network::default_listen_address)
+        .await
+        .map_err(|_| "无法检测局域网 IPv4 地址".to_string())?
+}
+#[tauri::command]
 fn service_status(bridge: Backend<'_>) -> ServiceStatus {
     bridge.status()
 }
@@ -97,11 +103,25 @@ async fn sumatra_status(manager: State<'_, Arc<SumatraManager>>) -> Result<Downl
 #[tauri::command]
 async fn download_sumatra(
     manager: State<'_, Arc<SumatraManager>>,
+    bridge: Backend<'_>,
 ) -> Result<DownloadStatus, String> {
+    if bridge.status().running || bridge.has_active_print()? {
+        return Err("请先停止打印服务，等待当前打印完成后下载或更新组件".into());
+    }
     let manager = Arc::clone(manager.inner());
     tauri::async_runtime::spawn_blocking(move || manager.download())
         .await
         .map_err(|_| "打印组件下载任务异常，请重试".to_string())?
+}
+
+#[tauri::command]
+async fn check_sumatra_update(
+    manager: State<'_, Arc<SumatraManager>>,
+) -> Result<DownloadStatus, String> {
+    let manager = Arc::clone(manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.check_update())
+        .await
+        .map_err(|_| "无法检查打印组件更新".to_string())?
 }
 
 fn show(app: &tauri::AppHandle) {
@@ -175,6 +195,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             service_status,
+            default_listen_address,
             list_printers,
             save_printer,
             available_printers,
@@ -188,6 +209,7 @@ pub fn run() {
             stop_service,
             set_authentication_required,
             sumatra_status,
+            check_sumatra_update,
             download_sumatra
         ])
         .build(tauri::generate_context!())

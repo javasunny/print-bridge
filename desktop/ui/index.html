@@ -1,22 +1,61 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Print Bridge</title><link rel="stylesheet" href="style.css"></head>
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Print Bridge</title><link rel="stylesheet" href="style.css">
+</head>
 <body>
-<header><div class="wordmark"><span class="mark" aria-hidden="true">▤</span> PRINT BRIDGE <span class="edition">LOCAL / 01</span></div><span id="mode" class="pill">正在连接</span></header>
+<header><div class="wordmark"><span class="mark" aria-hidden="true">▤</span> PRINT BRIDGE <span class="edition">LOCAL PRINT</span></div><span id="mode" class="pill">正在连接</span></header>
 <main>
-  <section class="intro"><div><p class="eyebrow">WINDOWS → macOS</p><h1>让打印，跨越系统。</h1><p class="muted">共享本机打印队列，在 Mac 的系统打印窗口中直接使用。</p></div><div class="service-state"><span id="lamp" class="lamp"></span><strong id="service-state">服务未启动</strong><small id="service-address">仅在可信局域网使用</small></div></section>
+  <section class="intro"><div><p class="eyebrow">WINDOWS → macOS</p><h1>本机打印共享</h1><p class="muted">管理共享队列，查看来自 Mac 的任务与连接。</p></div><div class="service-state"><span id="lamp" class="lamp"></span><strong id="service-state">服务未启动</strong><small id="service-address">正在检测局域网地址</small></div></section>
   <div id="message" role="status" aria-live="polite" hidden></div>
-  <section class="service-bar" aria-label="IPP 服务"><label>监听地址<input id="address" value="127.0.0.1:8631" spellcheck="false" aria-describedby="network-note"></label><button id="start" class="primary">启动服务</button><button id="stop" disabled>停止服务</button><p id="network-note">共享给 Mac 时填入 Windows 的局域网 IPv4 地址。HTTP 不加密令牌或文档。</p></section>
-  <nav aria-label="管理内容"><button class="tab active" data-tab="printers" aria-selected="true">01　共享打印机 <span id="printer-count">0</span></button><button class="tab" data-tab="jobs" aria-selected="false">02　打印任务</button><button class="tab" data-tab="devices" aria-selected="false">03　设备凭据</button><button class="tab" data-tab="settings" aria-selected="false">04　设置</button><button class="tab" data-tab="connections" aria-selected="false">05　连接诊断</button></nav>
-  <section id="printers" class="panel">
-    <div class="section-heading"><div><h2>连接你的打印机</h2><p class="muted">每台打印机拥有独立地址，任务始终交给绑定的 Windows 队列。</p></div><button id="refresh-printers">刷新本机队列</button></div>
-    <form id="printer-form" class="form-grid"><label>桥接 ID<input name="id" required pattern="[a-zA-Z0-9_-]+" maxlength="64" placeholder="office"></label><label>显示名称<input name="name" required maxlength="120" placeholder="办公室打印机"></label><label class="wide">Windows 队列<select name="queue" id="queue" required><option value="">请选择本机队列</option></select></label><label>最大份数<input name="max_copies" type="number" min="1" max="99" value="99" required></label><div class="checks"><label><input name="duplex" type="checkbox">已验证支持双面</label><label><input name="enabled" type="checkbox" checked>启用共享</label></div><div class="form-actions"><button type="submit" class="primary">保存打印机</button><button type="button" id="reset-printer">清空表单</button><small>纸张固定为 A4。修改现有打印机请先点击下方“编辑”。</small></div></form>
-    <div id="printer-list" class="list"></div>
-    <details class="guide"><summary>如何在 macOS 添加打印机？</summary><ol><li>启动服务，放行 Windows 防火墙的对应端口，仅限可信私有网络。</li><li>在“系统设置 → 打印机与扫描仪”中添加 IP 打印机，使用 IPP 协议。</li><li>地址填写 Windows IP 和端口，队列填写 <code>ipp/printers/桥接ID</code>；或使用下方复制的完整 IPP 地址。</li><li>若开启设备认证，用户名填写设备 ID，密码填写创建时显示的令牌；关闭认证时无需填写。</li></ol><p>PDF、驱动选择和认证方式须在目标 macOS 上验证。此版本不宣称支持 AirPrint；若系统要求其他文档格式，请停止并记录兼容性问题。</p></details>
+  <section class="service-bar" aria-label="IPP 服务">
+    <label>监听地址<input id="address" placeholder="局域网 IPv4:8631" spellcheck="false" aria-describedby="network-note"></label>
+    <button id="start" class="primary">启动服务</button><button id="stop" disabled>停止服务</button>
+    <p id="network-note">启动时自动检测局域网 IPv4，可手动修改。仅在可信私有网络中使用。</p>
   </section>
-  <section id="jobs" class="panel" hidden><div class="section-heading"><div><h2>打印任务</h2><p class="muted">“已提交”表示交给 Windows，不代表已经出纸。</p></div><div class="inline"><label class="sr-only" for="filter">筛选打印机</label><select id="filter"><option value="">全部打印机</option></select><button id="refresh-jobs">刷新</button></div></div><div id="job-list" class="list"></div><p class="footnote">仅等待任务可取消。待核查任务请先检查 Windows 队列和实际出纸情况，不要直接重复打印。</p></section>
-  <section id="devices" class="panel" hidden><div class="section-heading"><div><h2>允许哪些设备打印</h2><p class="muted">每个令牌可访问全部已启用的打印机，请勿共享给不可信设备。</p></div></div><form id="device-form" class="inline"><label>设备名称<input name="name" required maxlength="120" placeholder="我的 MacBook"></label><button class="primary" type="submit">创建设备凭据</button></form><div id="secret" class="secret" hidden><strong>请现在保存，完整令牌只显示一次。</strong><label>用户名<input id="secret-id" readonly></label><label>密码 / 令牌<input id="secret-token" readonly autocomplete="off" spellcheck="false"></label><button id="dismiss-secret">已保存，隐藏令牌</button></div><div id="device-list" class="list"></div></section>
-  <section id="settings" class="panel" hidden><div class="section-heading"><div><h2>打印认证</h2><p class="muted">修改前请先停止服务。关闭认证后，连接到服务的局域网设备可直接打印及管理匿名任务。</p></div></div><article class="list-card"><div class="checks"><label><input id="authentication-required" type="checkbox" checked>要求设备认证（用户名和令牌）</label></div><div class="card-actions"><button id="save-authentication">保存认证设置</button></div></article><div class="section-heading"><div><h2>打印组件</h2><p class="muted">首次打印前，点击下载 SumatraPDF。下载完成后可离线打印。</p></div><button id="refresh-sumatra">检查状态</button></div><article class="list-card"><div><h3>SumatraPDF <span id="sumatra-version" class="badge"></span></h3><p id="sumatra-state" role="status" aria-live="polite">正在检查</p><p id="sumatra-path"></p><p>从 SumatraPDF 官方网站下载，完整性校验通过后才会启用。下载失败可直接重试。</p></div><div class="card-actions"><button id="download-sumatra" class="primary">下载打印组件</button></div></article><p class="footnote">约 11 MB，首次下载需要联网。组件保存在当前用户应用数据目录，升级应用后可继续使用。</p></section>
-  <section id="connections" class="panel" hidden><div class="section-heading"><div><h2>Mac 连接诊断</h2><p class="muted">查看请求来源、操作和拒绝原因。打开此页时每 2 秒更新。</p></div><button id="refresh-connections">刷新连接记录</button></div><div id="connection-list" class="list"></div><p class="footnote">保留本次程序运行期间最近 100 条 HTTP/IPP 请求。查询打印机成功代表服务可达；出现“任务已接收”才代表打印文件已进入桥接任务列表。</p></section>
-</main><footer><span>本地运行 · 无云服务 · 仅 IPP</span><span>关闭窗口后继续在系统托盘运行</span></footer><script type="module" src="app.js"></script>
-</body></html>
+  <nav aria-label="管理内容">
+    <button class="tab active" data-tab="printers" aria-selected="true">共享打印机</button>
+    <button class="tab" data-tab="jobs" aria-selected="false">打印任务</button>
+    <button class="tab" data-tab="devices" aria-selected="false">设备凭据</button>
+    <button class="tab" data-tab="settings" aria-selected="false">设置</button>
+    <button class="tab" data-tab="connections" aria-selected="false">连接诊断</button>
+  </nav>
+  <section id="printers" class="panel">
+    <div class="section-heading"><div><h2>共享打印机 <span id="printer-count" class="count">0</span></h2><p class="muted">绑定 Windows 队列，将下方各字段分别填入 macOS。</p></div><button id="refresh-printers">刷新本机队列</button></div>
+    <form id="printer-form" class="form-grid">
+      <label>桥接 ID<input name="id" required pattern="[a-zA-Z0-9_-]+" maxlength="64" placeholder="office"></label>
+      <label>显示名称<input name="name" required maxlength="120" placeholder="办公室打印机"></label>
+      <label>Windows 队列<select name="queue" id="queue" required><option value="">请选择本机队列</option></select></label>
+      <label>最大份数<input name="max_copies" type="number" min="1" max="99" value="99" required></label>
+      <div class="checks"><label><input name="duplex" type="checkbox">已验证支持双面</label><label><input name="enabled" type="checkbox" checked>启用共享</label></div>
+      <div class="form-actions"><button type="submit" class="primary">保存打印机</button><button type="button" id="reset-printer">清空表单</button></div>
+    </form>
+    <div id="printer-list" class="list"></div>
+    <details class="guide"><summary>macOS 添加步骤</summary><ol><li>启动服务，Windows 防火墙放行对应端口，仅限可信私有网络。</li><li>打开“系统设置 → 打印机与扫描仪 → 添加 → IP”。将每台打印机的 Address、Protocol、Queue 分别填入对应位置。</li><li>Name 可填写共享打印机的显示名称。若 Use 自动选中 PostScript，请选 Other 并使用 Print Bridge PDF A4 PPD。</li><li>开启认证时，用户名填设备 ID，密码填令牌；关闭认证时无需填写。</li></ol><p>当前纸张为 A4。已提交表示交给 Windows，不代表已经出纸。</p></details>
+  </section>
+  <section id="jobs" class="panel" hidden>
+    <div class="section-heading"><div><h2>打印任务 <span id="job-count" class="count">0</span></h2><p class="muted">打开此页时每 2 秒自动刷新。“已提交”表示已交给 Windows。</p></div><div class="inline"><label class="sr-only" for="filter">筛选打印机</label><select id="filter"><option value="">全部打印机</option></select><button id="refresh-jobs">刷新</button></div></div>
+    <div id="job-list" class="table-scroll"></div><p class="footnote">仅等待任务可取消。待核查任务请先检查 Windows 队列和实际出纸情况。</p>
+  </section>
+  <section id="devices" class="panel" hidden>
+    <div class="section-heading"><div><h2>设备凭据</h2><p class="muted">撤销后立即失效并从列表移除，历史打印任务仍保留。</p></div></div>
+    <form id="device-form" class="inline"><label>设备名称<input name="name" required maxlength="100" placeholder="我的 MacBook"></label><button class="primary" type="submit">创建设备凭据</button></form>
+    <div id="secret" class="secret" hidden><strong>请现在保存，完整令牌只显示一次。</strong><div class="secret-fields"><label>用户名<input id="secret-id" readonly></label><label>密码 / 令牌<input id="secret-token" readonly autocomplete="off" spellcheck="false"></label></div><button id="dismiss-secret">已保存，隐藏令牌</button></div>
+    <div id="device-list" class="list"></div>
+  </section>
+  <section id="settings" class="panel" hidden>
+    <div class="authentication-setting"><label class="checkbox-label"><input id="authentication-required" type="checkbox" checked>要求设备认证</label><span id="authentication-note" role="status">关闭后，局域网设备无需用户名和令牌即可打印。</span></div>
+    <div class="section-heading component-heading"><div><h2>SumatraPDF 打印组件</h2><p class="muted">检查官方稳定版，下载并校验后安装。更新前请停止打印服务。</p></div><div class="inline"><button id="check-sumatra-update">检查更新</button><button id="download-sumatra" class="primary">下载组件</button></div></div>
+    <div class="component-status"><div><span class="field-label">当前版本</span><strong id="sumatra-current">正在检查</strong></div><div><span class="field-label">最新稳定版</span><strong id="sumatra-latest">尚未检查</strong></div><p id="sumatra-state" role="status" aria-live="polite">正在检查组件状态</p></div>
+    <p id="sumatra-path" class="component-path"></p><p class="footnote">组件保存在当前用户应用数据目录，升级应用后可继续使用；更新失败会保留已安装组件。</p>
+  </section>
+  <section id="connections" class="panel" hidden>
+    <div class="section-heading"><div><h2>连接诊断 <span id="connection-count" class="count">0</span></h2><p class="muted">打开此页时每 2 秒自动刷新，显示请求来源、操作和处理结果。</p></div><button id="refresh-connections">刷新</button></div>
+    <div id="connection-list" class="table-scroll"></div><p class="footnote">保留本次运行最近 100 条请求。“查询打印机”代表服务可达；“任务已接收”才表示 PDF 已进入任务列表。</p>
+  </section>
+</main>
+<footer><span>本地运行 · 无云服务 · 仅 IPP</span><span>关闭窗口后继续在系统托盘运行</span></footer>
+<script type="module" src="app.js"></script>
+</body>
+</html>

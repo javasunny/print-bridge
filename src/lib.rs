@@ -1,5 +1,6 @@
 pub mod download;
 pub mod ipp;
+pub mod network;
 pub mod printing;
 mod service;
 mod store;

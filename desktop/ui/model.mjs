@@ -12,6 +12,15 @@ export function printerUrl(address, id) {
   if (!address) return null;
   return `ipp://${address}/ipp/printers/${encodeURIComponent(id)}`;
 }
+export function printerSetup(address, id) {
+  if (!address) return null;
+  return { address, protocol: 'Internet Printing Protocol - IPP', queue: `ipp/printers/${encodeURIComponent(id)}` };
+}
+export function authenticationNotice(service) {
+  if (service.authentication_restart_required) return '设置已保存，请重启服务后生效。';
+  if (!service.running) return '设置已保存，下次启动服务时生效。';
+  return service.active_authentication_required ? '当前服务要求设备认证。' : '当前服务无需认证。';
+}
 export function printerFromForm(form) {
   return {
     id: String(form.get('id') || '').trim(), name: String(form.get('name') || '').trim(),

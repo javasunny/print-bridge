@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { canCancel, printerUrl, printerFromForm, stateLabel, connectionResult } from './model.mjs';
+import { canCancel, printerUrl, printerSetup, printerFromForm, stateLabel, connectionResult, authenticationNotice } from './model.mjs';
 
 test('only pending jobs expose cancellation', () => {
   assert.equal(canCancel({ state: 'pending' }), true);
@@ -12,6 +12,18 @@ test('IPP addresses do not contain credentials and encode bridge identifiers', (
   assert.equal(printerUrl(null, 'office'), null);
   assert.equal(printerUrl('192.168.1.8:8631', 'office'), 'ipp://192.168.1.8:8631/ipp/printers/office');
   assert.equal(printerUrl('[::1]:8631', 'front desk'), 'ipp://[::1]:8631/ipp/printers/front%20desk');
+});
+test('macOS setup fields split host, protocol and queue without duplicating the scheme', () => {
+  assert.equal(printerSetup('', 'office'), null);
+  assert.deepEqual(printerSetup('192.168.8.159:8631', 'front desk'), {
+    address: '192.168.8.159:8631', protocol: 'Internet Printing Protocol - IPP', queue: 'ipp/printers/front%20desk',
+  });
+});
+test('authentication notice distinguishes pending configuration from the running policy', () => {
+  assert.match(authenticationNotice({ running: true, authentication_restart_required: true, active_authentication_required: true }), /重启服务/);
+  assert.match(authenticationNotice({ running: false, authentication_restart_required: false }), /下次启动/);
+  assert.match(authenticationNotice({ running: true, active_authentication_required: false }), /无需认证/);
+  assert.match(authenticationNotice({ running: true, active_authentication_required: true }), /要求设备认证/);
 });
 test('unchecked capability does not become enabled through a string cast', () => {
   const form = new Map([['id', ' office '], ['name', ' Office '], ['queue', 'Exact Queue'], ['max_copies', '2'], ['enabled', 'on']]);

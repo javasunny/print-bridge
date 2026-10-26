@@ -19,7 +19,7 @@ Windows 多打印机 IPP 桥接 MVP，使用 Tauri 和 Rust。macOS 通过各打
 
 用户直接安装 Windows 安装包。启动后打开“设置 → 下载打印组件”，下载完成后配置共享打印机和设备凭据。
 
-本机构建产物位于 `dist`：推荐安装 `Print Bridge_0.1.2_x64-setup.exe`，安装程序按需下载 WebView2；独立应用 `Print-Bridge-Windows-x64.exe` 要求系统已有 WebView2。两个文件均未签名。
+本机构建产物位于 `dist`：推荐安装 `Print Bridge_0.1.3_x64-setup.exe`，安装程序按需下载 WebView2；独立应用 `Print-Bridge-Windows-x64.exe` 要求系统已有 WebView2。两个文件均未签名。
 
 从源码运行时，Windows 开发环境需要 Rust MSVC 工具链、Visual Studio C++ 构建工具和 WebView2：
 

@@ -108,6 +108,30 @@ fn native_macos_queue_prints_pdf_without_authentication_in_simulation() {
             "media=A4",
             "-o",
             "sides=one-sided",
+            "-o",
+            "AP_ColorMatchingMode=AP_ApplicationColorMatching",
+            "-o",
+            "AP_D_InputSlot=",
+            "-o",
+            "ColorModel=Gray",
+            "-o",
+            "Duplex=None",
+            "-o",
+            "collate=false",
+            "-o",
+            "pserrorhandler-requested=standard",
+            "-o",
+            "job-priority=50",
+            "-o",
+            "PaperInfoIsSuggested..b.=true",
+            "-o",
+            "PDFIsProtected..b.=false",
+            "-o",
+            "DestinationPrinterID=compatibility-test",
+            "-o",
+            "com.apple.print.PrintSettings.PMCopies..n.=1",
+            "-o",
+            "com.apple.print.JobInfo.PMJobName=private-test-title",
             "/usr/share/cups/ipptool/document-a4.pdf",
         ])
         .output()
@@ -134,8 +158,9 @@ fn native_macos_queue_prints_pdf_without_authentication_in_simulation() {
                 .unwrap();
             bridge.stop().unwrap();
             panic!(
-                "Native queue did not reach simulation: {}",
-                String::from_utf8_lossy(&status.stdout)
+                "Native queue did not reach simulation: {}\nDiagnostics: {:?}",
+                String::from_utf8_lossy(&status.stdout),
+                bridge.connection_events()
             );
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -145,6 +170,9 @@ fn native_macos_queue_prints_pdf_without_authentication_in_simulation() {
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].device_id, "anonymous");
     assert_eq!(jobs[0].state, "simulated");
+    assert!(!serde_json::to_string(&bridge.connection_events())
+        .unwrap()
+        .contains("private-test-title"));
     assert!(bridge
         .connection_events()
         .iter()

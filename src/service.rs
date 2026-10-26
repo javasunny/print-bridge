@@ -30,6 +30,27 @@ struct IppOutcome {
     status: u16,
     detail: String,
 }
+#[derive(Clone)]
+struct HttpFailureDetail(&'static str);
+
+fn body_error_response(error: axum::Error) -> Response {
+    let too_large = std::error::Error::source(&error)
+        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+    let (status, detail) = if too_large {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "请求超过大小上限（PDF 最多 100 MiB）",
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            "文档传输中断或请求体读取失败，请重新提交",
+        )
+    };
+    let mut response = (status, detail).into_response();
+    response.extensions_mut().insert(HttpFailureDetail(detail));
+    response
+}
 pub(crate) fn router(bridge: Arc<Bridge>) -> Router {
     Router::new()
         .route("/ipp/printers/{printer}", post(handle))
@@ -54,9 +75,10 @@ async fn record_connection(
     let timestamp = now();
     let response = next.run(request).await;
     let outcome = response.extensions().get::<IppOutcome>();
-    let detail = match outcome {
-        Some(outcome) => outcome.detail.clone(),
-        None => match response.status() {
+    let detail = match (outcome, response.extensions().get::<HttpFailureDetail>()) {
+        (Some(outcome), _) => outcome.detail.clone(),
+        (None, Some(failure)) => failure.0.to_string(),
+        (None, None) => match response.status() {
             StatusCode::UNAUTHORIZED => "认证失败或缺少设备凭据",
             StatusCode::NOT_FOUND => "未找到队列地址，请检查 macOS 的 Queue",
             StatusCode::METHOD_NOT_ALLOWED => "该地址需要 IPP POST 请求",
@@ -159,7 +181,7 @@ async fn handle(State(server): State<Server>, request: Request) -> Response {
     {
         Ok(Ok(body)) => body,
         Ok(Err(_)) if device.is_none() => return unauthorized(),
-        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Ok(Err(error)) => return body_error_response(error),
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
     if device.is_none()
@@ -389,7 +411,7 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
             }
             let (copies, sides) = match options(&message, &printer) {
                 Ok(o) => o,
-                Err((code, s)) => return fail(code, s),
+                Err((code, s)) => return fail(code, &s),
             };
             if message.code == VALIDATE_JOB {
                 return reply(&message, SUCCESSFUL_OK, vec![], "");
@@ -473,10 +495,7 @@ fn uri_path(uri: &str) -> Option<&str> {
     let (_, path) = rest.split_once('/')?;
     Some(&rest[rest.len() - path.len() - 1..])
 }
-fn options<'a>(
-    m: &'a Message<'_>,
-    p: &SharedPrinter,
-) -> Result<(u32, &'a str), (u16, &'static str)> {
+fn options<'a>(m: &'a Message<'_>, p: &SharedPrinter) -> Result<(u32, &'a str), (u16, String)> {
     for (name, tag) in [
         ("document-format", MIME_MEDIA_TYPE),
         ("sides", KEYWORD),
@@ -487,38 +506,52 @@ fn options<'a>(
         {
             return Err((
                 CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-                "Invalid print attribute type",
+                "Invalid print attribute type".into(),
             ));
         }
     }
     if text(m, "compression").is_some_and(|s| s != "none") {
         return Err((
             CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-            "Compression not supported",
+            "Compression not supported".into(),
         ));
     }
     for group in &m.groups {
-        if group.tag == JOB_ATTRIBUTES
-            && group.attributes.iter().any(|a| {
-                !matches!(
-                    a.name.as_str(),
-                    "copies"
-                        | "sides"
-                        | "media"
-                        | "PageSize"
-                        | "number-up"
-                        | "finishings"
-                        | "document-name-supplied"
-                        | "job-name"
-                        | "job-originating-host-name"
-                        | "job-uuid"
-                )
-            })
-        {
-            return Err((
-                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-                "Unsupported job attribute",
-            ));
+        if group.tag == JOB_ATTRIBUTES {
+            if let Some(attribute) = group.attributes.iter().find(|a| {
+                // macOS rendering tickets are client metadata; standard IPP options control the gateway.
+                !a.name.starts_with("com.apple.print.")
+                    && !matches!(
+                        a.name.as_str(),
+                        "copies"
+                            | "sides"
+                            | "media"
+                            | "PageSize"
+                            | "number-up"
+                            | "finishings"
+                            | "document-name-supplied"
+                            | "job-name"
+                            | "job-originating-host-name"
+                            | "job-uuid"
+                            | "AP_ColorMatchingMode"
+                            | "AP_D_InputSlot"
+                            | "ColorModel"
+                            | "Duplex"
+                            | "collate"
+                            | "pserrorhandler-requested"
+                            | "job-priority"
+                            | "job-hold-until"
+                            | "job-sheets"
+                            | "PaperInfoIsSuggested..b."
+                            | "PDFIsProtected..b."
+                            | "DestinationPrinterID"
+                    )
+            }) {
+                return Err((
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                    format!("Unsupported job attribute: {}", attribute.name),
+                ));
+            }
         }
     }
     if m.attribute("document-format").is_some()
@@ -528,27 +561,87 @@ fn options<'a>(
     {
         return Err((
             CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED,
-            "Only application/pdf is supported",
+            "Only application/pdf is supported".into(),
         ));
     }
     let copies = match m.attribute("copies") {
         Some(a) if a.tag == INTEGER => a.as_i32().filter(|n| *n > 0).ok_or((
             CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-            "Invalid copies",
+            "Invalid copies".into(),
         ))? as u32,
         Some(_) => {
             return Err((
                 CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-                "Invalid copies",
+                "Invalid copies".into(),
             ))
         }
         None => 1,
     };
     let sides = text(m, "sides").unwrap_or("one-sided");
+    for (name, tag, value) in [
+        ("AP_ColorMatchingMode", NAME, "AP_ApplicationColorMatching"),
+        ("AP_D_InputSlot", NAME, ""),
+        ("ColorModel", NAME, "Gray"),
+        ("Duplex", NAME, "None"),
+        ("pserrorhandler-requested", NAME, "standard"),
+        ("job-hold-until", KEYWORD, "no-hold"),
+    ] {
+        if m.attributes(name)
+            .any(|a| a.tag != tag || a.as_str() != Some(value))
+        {
+            return Err((
+                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                format!("Unsupported value for {name}"),
+            ));
+        }
+    }
+    for (name, unsupported) in [
+        (
+            "Duplex",
+            m.attribute("Duplex").is_some() && sides != "one-sided",
+        ),
+        (
+            "collate",
+            m.attributes("collate")
+                .any(|a| a.tag != BOOLEAN || copies != 1),
+        ),
+        (
+            "job-priority",
+            m.attributes("job-priority")
+                .any(|a| a.tag != INTEGER || a.as_i32() != Some(50)),
+        ),
+        (
+            "job-sheets",
+            m.attributes("job-sheets")
+                .any(|a| !matches!(a.tag, NAME | KEYWORD) || a.as_str() != Some("none")),
+        ),
+        (
+            "PaperInfoIsSuggested..b.",
+            m.attributes("PaperInfoIsSuggested..b.")
+                .any(|a| a.tag != BOOLEAN),
+        ),
+        (
+            "PDFIsProtected..b.",
+            m.attributes("PDFIsProtected..b.")
+                .any(|a| a.tag != BOOLEAN || a.value.as_slice() != [0]),
+        ),
+        (
+            "DestinationPrinterID",
+            m.attributes("DestinationPrinterID")
+                .any(|a| a.tag != NAME || a.as_str().is_none()),
+        ),
+    ] {
+        if unsupported {
+            return Err((
+                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                format!("Unsupported value for {name}"),
+            ));
+        }
+    }
     if text(m, "media").is_some_and(|s| !matches!(s, "iso_a4_210x297mm" | "A4")) {
         return Err((
             CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-            "Only A4 is supported",
+            "Only A4 is supported".into(),
         ));
     }
     if m.attributes("PageSize")
@@ -560,7 +653,7 @@ fn options<'a>(
     {
         return Err((
             CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-            "Unsupported page size, number-up or finishing",
+            "Unsupported page size, number-up or finishing".into(),
         ));
     }
     for name in [
@@ -575,14 +668,14 @@ fn options<'a>(
         if m.attribute(name).is_some() {
             return Err((
                 CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-                "Unsupported print option",
+                format!("Unsupported print option: {name}"),
             ));
         }
     }
     Bridge::validate_options(p, copies, sides).map_err(|_| {
         (
             CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-            "Unsupported copies or sides",
+            "Unsupported copies or sides".into(),
         )
     })?;
     Ok((copies, sides))
@@ -716,6 +809,52 @@ mod tests {
         ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
             panic!("authentication must complete before reading the body")
         }
+    }
+
+    struct InterruptedBody;
+    impl http_body::Body for InterruptedBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated interrupted upload",
+            ))))
+        }
+    }
+
+    #[test]
+    fn interrupted_upload_is_not_reported_as_a_size_limit_error() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let auth = STANDARD.encode(format!("{}:{}", device.device.id, device.token));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ipp/printers/office")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .header(header::AUTHORIZATION, format!("Basic {auth}"))
+                .body(Body::new(InterruptedBody))
+                .unwrap();
+            let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let event = bridge.connection_events().remove(0);
+            assert_eq!(event.http_status, 400);
+            assert!(event.detail.contains("传输中断"));
+            assert!(!event.detail.contains("大小"));
+            assert!(bridge.list_jobs().unwrap().is_empty());
+            let error = to_bytes(Body::from(vec![0; 9]), 8).await.unwrap_err();
+            let response = body_error_response(error);
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(response
+                .extensions()
+                .get::<HttpFailureDetail>()
+                .unwrap()
+                .0
+                .contains("100 MiB"));
+        });
     }
 
     fn request_bytes(operation: u16, printer: &str, extra: Vec<Attribute>, pdf: &[u8]) -> Vec<u8> {
@@ -989,6 +1128,24 @@ mod tests {
                 Attribute::integer(INTEGER, "number-up", 1),
                 Attribute::text(NAME, "PageSize", "A4"),
                 Attribute::text(KEYWORD, "sides", "one-sided"),
+                Attribute::text(NAME, "AP_ColorMatchingMode", "AP_ApplicationColorMatching"),
+                Attribute::text(NAME, "AP_D_InputSlot", ""),
+                Attribute::text(NAME, "ColorModel", "Gray"),
+                Attribute::text(NAME, "Duplex", "None"),
+                Attribute::boolean("collate", false),
+                Attribute::text(NAME, "pserrorhandler-requested", "standard"),
+                Attribute::integer(INTEGER, "job-priority", 50),
+                Attribute::text(KEYWORD, "job-hold-until", "no-hold"),
+                Attribute::text(NAME, "job-sheets", "none"),
+                Attribute::boolean("PaperInfoIsSuggested..b.", true),
+                Attribute::boolean("PDFIsProtected..b.", false),
+                Attribute::text(NAME, "DestinationPrinterID", "local-printer"),
+                Attribute::text(NAME, "com.apple.print.PrintSettings.PMCopies..n.", "1"),
+                Attribute::text(
+                    NAME,
+                    "com.apple.print.JobInfo.PMJobName",
+                    "private-test-title",
+                ),
             ],
         );
         let mut groups = [operation, job];
@@ -1251,6 +1408,22 @@ mod tests {
                     Attribute::integer(ENUM, "finishings", 4),
                     CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
                 ),
+                (
+                    Attribute::text(NAME, "AP_D_InputSlot", "Tray2"),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::text(NAME, "ColorModel", "RGB"),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::text(NAME, "Duplex", "DuplexNoTumble"),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::integer(INTEGER, "job-priority", 75),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
             ] {
                 let bytes = call(
                     &bridge,
@@ -1408,6 +1581,12 @@ mod tests {
                 parse(&bytes).unwrap().code,
                 CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED
             );
+            let expected = "Unsupported job attribute: unsupported-job-setting";
+            assert_eq!(
+                text(&parse(&bytes).unwrap(), "status-message"),
+                Some(expected)
+            );
+            assert_eq!(bridge.connection_events()[0].detail, expected);
             assert!(bridge.list_jobs().unwrap().is_empty());
         });
     }

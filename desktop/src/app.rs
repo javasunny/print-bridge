@@ -64,8 +64,16 @@ fn list_jobs(bridge: Backend<'_>) -> Result<Vec<Job>, String> {
     bridge.list_jobs()
 }
 #[tauri::command]
+fn clear_job_history(bridge: Backend<'_>) -> Result<usize, String> {
+    bridge.clear_job_history()
+}
+#[tauri::command]
 fn list_connection_events(bridge: Backend<'_>) -> Vec<ConnectionEvent> {
     bridge.connection_events()
+}
+#[tauri::command]
+fn clear_connection_events(bridge: Backend<'_>) -> usize {
+    bridge.clear_connection_events()
 }
 #[tauri::command]
 fn cancel_job(bridge: Backend<'_>, id: i64) -> Result<(), String> {
@@ -203,7 +211,9 @@ pub fn run() {
             create_device,
             revoke_device,
             list_jobs,
+            clear_job_history,
             list_connection_events,
+            clear_connection_events,
             cancel_job,
             start_service,
             stop_service,

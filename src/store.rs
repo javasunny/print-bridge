@@ -396,6 +396,25 @@ impl Bridge {
             .map_err(err);
         result
     }
+    pub fn clear_job_history(&self) -> Result<usize> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db
+            .prepare("SELECT file FROM jobs WHERE file<>'' AND state IN ('submitted','simulated','failed','canceled','completed')")
+            .map_err(err)?;
+        for row in stmt.query_map([], |r| r.get::<_, String>(0)).map_err(err)? {
+            let path = self.root.join("documents").join(row.map_err(err)?);
+            match fs::remove_file(path) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(err(error)),
+            }
+        }
+        db.execute(
+            "DELETE FROM jobs WHERE state IN ('submitted','simulated','failed','canceled','completed')",
+            [],
+        )
+        .map_err(err)
+    }
     pub(crate) fn job(&self, id: i64) -> Result<Job> {
         let db = self.db.lock().unwrap();
         db.query_row("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper,color_mode FROM jobs WHERE id=?",[id],job_row).map_err(|_|"任务不存在".into())
@@ -825,6 +844,12 @@ impl Bridge {
             .rev()
             .cloned()
             .collect()
+    }
+    pub fn clear_connection_events(&self) -> usize {
+        let mut events = self.connection_events.lock().unwrap();
+        let count = events.len();
+        events.clear();
+        count
     }
     pub(crate) fn record_connection_event(&self, event: ConnectionEvent) {
         let mut events = self.connection_events.lock().unwrap();
@@ -1482,6 +1507,103 @@ pub(crate) mod tests {
         assert_eq!(events.len(), 100);
         assert_eq!(events.first().unwrap().timestamp, 104);
         assert_eq!(events.last().unwrap().timestamp, 5);
+    }
+
+    #[test]
+    fn clearing_connection_history_allows_new_requests() {
+        let (_directory, bridge, _) = fixture();
+        assert_eq!(bridge.clear_connection_events(), 0);
+        let event = ConnectionEvent {
+            timestamp: 1,
+            client_ip: Some("192.168.1.8".into()),
+            method: "POST".into(),
+            path: "/ipp/printers/office".into(),
+            operation: Some(crate::ipp::GET_PRINTER_ATTRIBUTES),
+            http_status: 200,
+            ipp_status: Some(0),
+            detail: "Capability query".into(),
+        };
+        bridge.record_connection_event(event.clone());
+        bridge.record_connection_event(event.clone());
+        assert_eq!(bridge.clear_connection_events(), 2);
+        assert!(bridge.connection_events().is_empty());
+        bridge.record_connection_event(ConnectionEvent {
+            timestamp: 2,
+            ..event
+        });
+        assert_eq!(bridge.connection_events().len(), 1);
+        assert_eq!(bridge.connection_events()[0].timestamp, 2);
+    }
+
+    #[test]
+    fn clearing_job_history_removes_finished_jobs_and_documents_but_keeps_unresolved_jobs() {
+        let (directory, bridge, device) = fixture();
+        assert_eq!(bridge.clear_job_history().unwrap(), 0);
+        let mut removed = Vec::new();
+        let mut retained = Vec::new();
+        for state in [
+            "submitted",
+            "simulated",
+            "failed",
+            "canceled",
+            "completed",
+            "pending",
+            "pending-document",
+            "pending-final-document",
+            "processing",
+            "uncertain",
+        ] {
+            let job = submit(&bridge, &device);
+            bridge
+                .db
+                .lock()
+                .unwrap()
+                .execute("UPDATE jobs SET state=? WHERE id=?", params![state, job.id])
+                .unwrap();
+            let entry = (job.id, document_path(&bridge, job.id));
+            if matches!(
+                state,
+                "submitted" | "simulated" | "failed" | "canceled" | "completed"
+            ) {
+                removed.push(entry);
+            } else {
+                retained.push(entry);
+            }
+        }
+        fs::remove_file(&removed[0].1).unwrap();
+        let no_document = bridge
+            .create_ipp_job(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                "auto",
+            )
+            .unwrap();
+        bridge.cancel_job(no_document.id).unwrap();
+        assert_eq!(bridge.clear_job_history().unwrap(), 6);
+        assert!(bridge.job(no_document.id).is_err());
+        for (id, path) in &removed {
+            assert!(bridge.job(*id).is_err());
+            assert!(!path.exists());
+        }
+        for (id, path) in &retained {
+            assert!(bridge.job(*id).is_ok());
+            assert!(path.is_file());
+        }
+        assert_eq!(bridge.list_jobs().unwrap().len(), retained.len());
+        assert_eq!(bridge.clear_job_history().unwrap(), 0);
+        let next = submit(&bridge, &device);
+        assert!(next.id > no_document.id);
+        assert_eq!(bridge.list_devices().unwrap().len(), 1);
+        assert_eq!(bridge.list_printers().unwrap().len(), 1);
+        drop(bridge);
+        let reopened = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+        assert_eq!(reopened.list_jobs().unwrap().len(), retained.len() + 1);
+        for (id, _) in removed {
+            assert!(reopened.job(id).is_err());
+        }
     }
 
     #[test]

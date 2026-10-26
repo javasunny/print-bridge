@@ -32,6 +32,8 @@ cargo run --manifest-path desktop/Cargo.toml --locked
 
 Windows 启动服务后打开“连接诊断”，可看到最近 100 条 HTTP/IPP 请求的来源 IP、时间、队列路径、操作、HTTP/IPP 状态和拒绝原因。连接诊断和打印任务使用横向表格，打开对应页时每 2 秒自动刷新。诊断记录只保留在本次运行的内存中，不记录令牌、请求头、文档标题或 PDF 内容。
 
+“打印任务”和“连接诊断”均可点击“清除记录”。打印任务会清除全部打印机的已结束记录及对应缓存文档，不受当前打印机筛选影响；等待、处理中和待核查任务保留。连接诊断会清空当前记录，后续请求继续记录。清除后立即刷新列表和数量。
+
 在 Mac 的仓库根目录执行以下只读探测，替换 Windows IP、端口和桥接 ID：
 
 ```sh
@@ -56,7 +58,7 @@ cargo run --manifest-path desktop/Cargo.toml --locked -- --simulate
 
 ```sh
 node --check desktop/ui/app.js
-node --test desktop/ui/model.test.mjs
+node --test desktop/ui/*.test.mjs
 cargo fmt --manifest-path desktop/Cargo.toml --check
 cargo check --manifest-path desktop/Cargo.toml --locked
 ```

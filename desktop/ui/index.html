@@ -46,8 +46,8 @@
     <details class="guide"><summary>Mac / iPhone / iPad 添加步骤</summary><ol><li>启动服务，Windows 防火墙在私有网络放行服务 TCP 端口和 Bonjour UDP 5353。</li><li>Mac 打开“系统设置 → 打印机与扫描仪 → 添加”，在默认列表选择共享打印机，Use 选择 AirPrint，无需下载 PPD。</li><li>iPhone / iPad 与 Windows 处于同一局域网，在应用的“打印 → 选择打印机”中选择共享名称。</li><li>开启认证时，用户名填设备 ID，密码填令牌；关闭认证时无需填写。自动发现失败时，Mac 可手动填写 Address、Protocol、Queue；旧 PPD 仍可作为备用。</li></ol><p>纸张和双面选项以每台打印机的已验证配置为准；修改能力后，Mac 可能需要重新添加队列。已提交表示交给 Windows，不代表已经出纸。iPhone/iPad 实际打印仍需联机验收。</p></details>
   </section>
   <section id="jobs" class="panel" hidden>
-    <div class="section-heading"><div><h2>打印任务 <span id="job-count" class="count">0</span></h2><p class="muted">打开此页时每 2 秒自动刷新。“已提交”表示已交给 Windows。</p></div><div class="inline"><label class="sr-only" for="filter">筛选打印机</label><select id="filter"><option value="">全部打印机</option></select><button id="refresh-jobs">刷新</button></div></div>
-    <div id="job-list" class="table-scroll"></div><p class="footnote">仅等待任务可取消。待核查任务请先检查 Windows 队列和实际出纸情况。</p>
+    <div class="section-heading"><div><h2>打印任务 <span id="job-count" class="count">0</span></h2><p class="muted">打开此页时每 2 秒自动刷新。“已提交”表示已交给 Windows。</p></div><div class="inline"><label class="sr-only" for="filter">筛选打印机</label><select id="filter"><option value="">全部打印机</option></select><button id="refresh-jobs">刷新</button><button id="clear-jobs">清除记录</button></div></div>
+    <div id="job-list" class="table-scroll"></div><p class="footnote">仅等待任务可取消。清除记录会删除全部打印机的已结束任务，保留等待、处理中和待核查任务。待核查任务请先检查 Windows 队列和实际出纸情况。</p>
   </section>
   <section id="devices" class="panel" hidden>
     <div class="section-heading"><div><h2>设备凭据</h2><p class="muted">撤销后立即失效并从列表移除，历史打印任务仍保留。</p></div></div>
@@ -62,7 +62,7 @@
     <p id="sumatra-path" class="component-path"></p><p class="footnote">组件保存在当前用户应用数据目录，升级应用后可继续使用；更新失败会保留已安装组件。</p>
   </section>
   <section id="connections" class="panel" hidden>
-    <div class="section-heading"><div><h2>连接诊断 <span id="connection-count" class="count">0</span></h2><p class="muted">打开此页时每 2 秒自动刷新，显示请求来源、操作和处理结果。</p></div><button id="refresh-connections">刷新</button></div>
+    <div class="section-heading"><div><h2>连接诊断 <span id="connection-count" class="count">0</span></h2><p class="muted">打开此页时每 2 秒自动刷新，显示请求来源、操作和处理结果。</p></div><div class="inline"><button id="refresh-connections">刷新</button><button id="clear-connections">清除记录</button></div></div>
     <div id="connection-list" class="table-scroll"></div><p class="footnote">保留本次运行最近 100 条请求。“查询打印机”代表服务可达；Create-Job 仅创建等待文档任务，收到文档并结束上传后才会进入打印队列。</p>
   </section>
 </main>

@@ -193,6 +193,16 @@ $('reset-printer').addEventListener('click', resetPrinter);
 $('refresh-printers').addEventListener('click', () => action(async () => { await refreshQueues(); await refreshPrinters(); }));
 $('refresh-jobs').addEventListener('click', () => action(refreshJobs));
 $('refresh-connections').addEventListener('click', () => action(refreshConnections));
+$('clear-jobs').addEventListener('click', () => action(async () => {
+  const count = await invoke('clear_job_history');
+  await refreshJobs();
+  message(`已清除 ${count} 条打印记录。等待、处理中和待核查任务已保留。`);
+}));
+$('clear-connections').addEventListener('click', () => action(async () => {
+  const count = await invoke('clear_connection_events');
+  await refreshConnections();
+  message(`已清除 ${count} 条诊断记录。后续请求将继续记录。`);
+}));
 $('filter').addEventListener('change', () => action(refreshJobs));
 $('address').addEventListener('input', renderPrinters);
 $('start').addEventListener('click', () => action(async () => {

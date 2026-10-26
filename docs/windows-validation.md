@@ -1,30 +1,24 @@
 # Windows 实机验证
 
-本清单用于验证真实打印链路。当前开发环境为 macOS，资源准备与模拟测试不能替代以下 Windows/macOS 联机验收。仅在用户授权后使用少量非敏感测试页。
+本清单用于验证真实打印链路。当前开发环境为 macOS，交叉构建与模拟测试不能替代以下 Windows/macOS 联机验收。仅在用户授权后使用少量非敏感测试页。
 
-## 构建资源
+## 交叉构建记录
 
-在仓库根目录执行：
+2026-10-26 在 Apple Silicon macOS 使用 Rust 1.99.1、cargo-xwin 0.23.1、Tauri CLI 2.12.4 和 NSIS 3.13，成功构建 Windows x64 EXE 与 NSIS 安装包，输出到 `dist`。PE 格式和导入项已检查，应用无需额外分发 Python、SumatraPDF 或 VC++ Runtime DLL；WebView2 由安装程序按需处理。产物未签名，尚未在 Windows 上安装运行。
 
-```sh
-python3 scripts/prepare_sumatra.py
-```
+43 项 Rust 核心测试、3 项文档测试、4 项前端测试通过；另外显式运行的官方下载测试通过，验证了归档及 EXE 摘要、安装和重新打开后的离线就绪状态。静态检查通过。链接阶段的 LNK4099 提示涉及缺少 Microsoft CRT 调试符号，不影响生成 release 文件。
 
-脚本下载固定的 SumatraPDF 3.6.1 x64 portable 和对应 `3.6.1rel` 完整源码归档，校验 `third_party/sumatra.lock.json` 中的 SHA-256，并生成 `desktop/resources/sumatra/`。该目录包括可执行文件、完整源码 ZIP、许可证、作者列表和资源清单；全部属于构建产物，不提交源码仓库。发布时须保留整个目录，不只分发 EXE。
+## 首次下载打印组件
 
-离线构建可以指定已取得的归档，摘要校验仍然执行：
+安装应用后，打开“设置 → 下载打印组件”。应用只从固定的 SumatraPDF 官方 HTTPS 地址下载 3.6.1 x64 portable ZIP，核对锁定的 SHA-256 后提取指定 EXE，再校验 EXE 摘要。不会自动下载或自动执行打印。
 
-```sh
-python3 scripts/prepare_sumatra.py --binary-archive <binary.zip> --source-archive <source.zip>
-```
-
-资源锁定基于下载归档的摘要，未将其描述为上游独立签名认证。准备脚本不会执行 SumatraPDF 或发起打印。
+下载失败时应显示错误并允许重试；未校验成功的组件不能标为就绪。验证首次下载、断网失败重试、校验失败，以及下载成功后重新打开应用仍可离线使用。组件位于用户应用数据目录的 `tools/sumatra`；原有下载不随应用升级清除。摘要是项目锁定值，不是上游独立签名认证。
 
 ## 验收顺序
 
 | 步骤 | 操作 | 通过标准 |
 |---|---|---|
-| 1 | 在未另装 SumatraPDF 的 Windows 11 x64 上安装应用 | 内置资源可用，配置窗口启动，WebView2 缺失时安装流程可处理 |
+| 1 | 在未另装 SumatraPDF 的 Windows 11 x64 上安装应用 | 配置窗口启动，WebView2 缺失时安装流程可处理；设置中手动下载并校验组件后可启动打印服务 |
 | 2 | 枚举并绑定两台 Windows 打印队列，分别使用稳定桥接 ID | 中文与含空格的队列名称正确，不能重复绑定同一队列 |
 | 3 | 创建设备凭据，启动私有网络 IPP 监听 | 客户端给出正确 IPP 地址；无网页上传入口 |
 | 4 | macOS 手动添加两台 IPP 打印机并认证 | 原生打印对话框可选；实际发送 PDF 与 Print-Job，凭据可以保存 |

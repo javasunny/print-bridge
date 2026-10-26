@@ -416,7 +416,7 @@ impl Bridge {
             return Err("真实打印仅支持 Windows；本机请使用模拟模式".into());
         }
         if !self.simulation && !self.sumatra.is_file() {
-            return Err("缺少随应用分发的 SumatraPDF 资源".into());
+            return Err("请先到设置下载 SumatraPDF 打印组件".into());
         }
         let listener = std::net::TcpListener::bind(addr).map_err(err)?;
         listener.set_nonblocking(true).map_err(err)?;

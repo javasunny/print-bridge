@@ -6,4 +6,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+.build-tools/
+dist/
 /desktop/resources/sumatra/

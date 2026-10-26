@@ -1,8 +1,8 @@
 # Print Bridge
 
-Windows 多打印机 IPP 桥接 MVP，使用 Tauri 和 Rust。macOS 通过各打印机独立的 IPP 地址提交 PDF，Windows 端使用内置 SumatraPDF 调用指定打印队列。
+Windows 多打印机 IPP 桥接 MVP，使用 Tauri 和 Rust。macOS 通过各打印机独立的 IPP 地址提交 PDF，Windows 端使用 SumatraPDF 调用指定打印队列。首次使用时在设置中手动下载打印组件。
 
-当前为可编译的开发版本。协议与模拟队列可以在 macOS 验证，Windows 安装包、macOS 系统打印对话框认证和真实出纸仍待实机验收，不能据此认定完整打印链路已通过。
+当前为开发版本，已在 macOS 上交叉构建 Windows x64 EXE 和 NSIS 安装包。Windows 安装运行、macOS 系统打印对话框认证和真实出纸仍待实机验收。
 
 ## 已实现
 
@@ -11,15 +11,18 @@ Windows 多打印机 IPP 桥接 MVP，使用 Tauri 和 Rust。macOS 通过各打
 - PDF 结构、加密、页数及大小检查；A4、1–99 份及能力允许的单双面。
 - SQLite 与 PDF 持久化、全局串行调度、等待任务取消；重启后处理中任务进入待核查。
 - 打印目标固定，不回退到默认打印机；超时或非零退出不会自动重打。
-- SumatraPDF 3.6.1 x64 资源准备脚本，固定 SHA-256，随包包含源码和许可证。
+- 设置中手动下载 SumatraPDF 3.6.1 x64，固定官方地址与 SHA-256，校验成功后启用，下载失败可重试。
 - 模拟与正式数据隔离，单实例文件锁，上传并发与任务容量限制，终态 PDF 超期清理。
 
 ## 运行
 
-Windows 上先安装 Rust MSVC 工具链、Visual Studio C++ 构建工具、Python 3 和 WebView2，然后执行：
+用户直接安装 Windows 安装包。启动后打开“设置 → 下载打印组件”，下载完成后配置共享打印机和设备凭据。
+
+本机构建产物位于 `dist`：推荐安装 `Print Bridge_0.1.0_x64-setup.exe`，安装程序按需下载 WebView2；独立应用 `Print-Bridge-Windows-x64.exe` 要求系统已有 WebView2。两个文件均未签名。
+
+从源码运行时，Windows 开发环境需要 Rust MSVC 工具链、Visual Studio C++ 构建工具和 WebView2：
 
 ```sh
-python scripts/prepare_sumatra.py
 cargo run --manifest-path desktop/Cargo.toml --locked
 ```
 
@@ -42,7 +45,6 @@ cargo run --manifest-path desktop/Cargo.toml --locked -- --simulate
 ```sh
 cargo test --locked
 cargo fmt --check
-python3 -B -m unittest discover -s tests -v
 node --test desktop/ui/model.test.mjs
 node --check desktop/ui/app.js
 cargo fmt --manifest-path desktop/Cargo.toml --check
@@ -62,3 +64,5 @@ Rust 测试包括监听 `127.0.0.1` 随机端口的分块 HTTP/IPP 模拟测试�
 - 能力由本地手动配置，应先在 Windows 驱动中验证。界面不提供彩色选择，颜色沿用驱动默认值。
 
 终态 PDF 保留 24 小时；等待、处理中和待核查的文件不自动删除。数据放在 Tauri 用户应用数据目录的 `production` 或 `simulation` 子目录。
+
+SumatraPDF 组件保存在同一应用数据根目录下的 `tools/sumatra`。安装包不包含该第三方可执行程序；仅在用户点击按钮后从官方网站下载。项目构建与测试均不依赖 Python。

@@ -9,16 +9,18 @@ base64 = "0.22"
 fs2 = "0.4"
 lopdf = "0.38"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 http-body = "1"
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.release]

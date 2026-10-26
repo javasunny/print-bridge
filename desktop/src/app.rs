@@ -1,4 +1,5 @@
 use print_bridge::{
+    download::{DownloadStatus, SumatraManager},
     printing::{self, PrinterInfo},
     Bridge, CreatedDevice, Device, Job, ServiceStatus, SharedPrinter,
 };
@@ -61,12 +62,37 @@ fn cancel_job(bridge: Backend<'_>, id: i64) -> Result<(), String> {
     bridge.cancel_job(id)
 }
 #[tauri::command]
-fn start_service(bridge: Backend<'_>, address: String) -> Result<(), String> {
+fn start_service(
+    bridge: Backend<'_>,
+    manager: State<'_, Arc<SumatraManager>>,
+    address: String,
+) -> Result<(), String> {
+    if !bridge.status().simulation && !manager.status().ready {
+        return Err("请先到设置下载并校验 SumatraPDF 打印组件".into());
+    }
     bridge.inner().start(&address)
 }
 #[tauri::command]
 fn stop_service(bridge: Backend<'_>) -> Result<(), String> {
     bridge.stop()
+}
+
+#[tauri::command]
+async fn sumatra_status(manager: State<'_, Arc<SumatraManager>>) -> Result<DownloadStatus, String> {
+    let manager = Arc::clone(manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.status())
+        .await
+        .map_err(|_| "无法检查打印组件".to_string())
+}
+
+#[tauri::command]
+async fn download_sumatra(
+    manager: State<'_, Arc<SumatraManager>>,
+) -> Result<DownloadStatus, String> {
+    let manager = Arc::clone(manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.download())
+        .await
+        .map_err(|_| "打印组件下载任务异常，请重试".to_string())?
 }
 
 fn show(app: &tauri::AppHandle) {
@@ -110,13 +136,12 @@ pub fn run() {
     }
     let app = tauri::Builder::default()
         .setup(move |app| {
-            let sumatra = app
-                .path()
-                .resource_dir()?
-                .join("resources/sumatra/SumatraPDF.exe");
-            let bridge = Bridge::open(app.path().app_data_dir()?, simulation, sumatra)
+            let data = app.path().app_data_dir()?;
+            let manager = Arc::new(SumatraManager::new(data.join("tools/sumatra")));
+            let bridge = Bridge::open(&data, simulation, manager.exe_path())
                 .map_err(std::io::Error::other)?;
             app.manage(bridge);
+            app.manage(manager);
             let open = MenuItem::with_id(app, "open", "打开 Print Bridge", true, None::<&str>)?;
             let exit = MenuItem::with_id(app, "exit", "停止服务并退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &exit])?;
@@ -150,7 +175,9 @@ pub fn run() {
             list_jobs,
             cancel_job,
             start_service,
-            stop_service
+            stop_service,
+            sumatra_status,
+            download_sumatra
         ])
         .build(tauri::generate_context!())
         .expect("无法启动 Print Bridge 桌面应用");

@@ -3,18 +3,15 @@ Copyright the SumatraPDF authors and contributing third-party projects.
 Project: https://github.com/sumatrapdfreader/sumatrapdf
 Release source: tag 3.6.1rel
 
-This product invokes the unmodified SumatraPDF executable as a separate process.
-SumatraPDF is distributed under GNU GPL version 3; see COPYING. Additional
-notices, authorship and component licenses are preserved in COPYING.BSD,
-AUTHORS and the complete SumatraPDF-source.zip archive supplied here.
+Print Bridge does not bundle or redistribute SumatraPDF binaries. On the user's
+explicit request in Settings, the app downloads the unmodified portable release
+directly from https://www.sumatrapdfreader.org and verifies pinned SHA-256 values.
+It then invokes that executable as a separate process for printing.
 
-Corresponding source is included with this distribution in SumatraPDF-source.zip,
-including build files and bundled dependency sources. It is not replaced by a
-link to the upstream project. See the source archive's readme and docs for build
-instructions. No SumatraPDF source modifications have been made by this project.
+Upstream license and source are available from the project and release tag:
+https://github.com/sumatrapdfreader/sumatrapdf/blob/3.6.1rel/COPYING
+https://github.com/sumatrapdfreader/sumatrapdf/tree/3.6.1rel
 
-Do not distribute only SumatraPDF.exe. Preserve this entire resource directory.
-Before publishing a release, verify the packaged binary matches the release
-manifest, all source/build inputs are present, and required component notices
-remain available. The preparation script does not establish legal clearance
-for any other dependencies or future modifications.
+This download-only distribution model replaces the former bundled resource
+workflow. If binaries are bundled in a future release, revisit the applicable
+license and corresponding-source distribution requirements before publishing.

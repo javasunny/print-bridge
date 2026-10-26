@@ -27,9 +27,6 @@
     "targets": [
       "nsis"
     ],
-    "resources": [
-      "resources/"
-    ],
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper",

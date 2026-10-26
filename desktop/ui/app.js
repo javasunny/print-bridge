@@ -5,6 +5,7 @@ const invoke = (command, args = {}) => window.__TAURI__.core.invoke(command, arg
 let printers = [];
 let service = { running: false, address: null };
 let busy = false;
+let downloadPending = false;
 
 function node(tag, text, className) {
   const el = document.createElement(tag);
@@ -121,7 +122,7 @@ for (const tab of document.querySelectorAll('[data-tab]')) tab.addEventListener(
     $(item.dataset.tab).hidden = !active;
   }
   if (tab.dataset.tab !== 'devices') hideSecret();
-  action(tab.dataset.tab === 'jobs' ? refreshJobs : tab.dataset.tab === 'devices' ? refreshDevices : refreshPrinters);
+  action(tab.dataset.tab === 'jobs' ? refreshJobs : tab.dataset.tab === 'devices' ? refreshDevices : tab.dataset.tab === 'settings' ? refreshSumatra : refreshPrinters);
 });
 $('printer-form').addEventListener('submit', (event) => { event.preventDefault(); action(async () => {
   await invoke('save_printer', { printer: printerFromForm(new FormData(event.target)) });
@@ -139,6 +140,27 @@ $('stop').addEventListener('click', () => action(async () => {
   await invoke('stop_service'); await refreshStatus(); await refreshPrinters(); message('服务已停止接收新任务，等待任务已保留。');
 }));
 function hideSecret() { $('secret').hidden = true; $('secret-id').value = ''; $('secret-token').value = ''; }
+async function refreshSumatra() {
+  const status = await invoke('sumatra_status');
+  $('sumatra-version').textContent = status.version;
+  $('sumatra-state').textContent = status.downloading || downloadPending ? '正在下载并校验，请稍候…' : status.ready ? '已就绪 · 校验通过' : '尚未安装或校验未通过';
+  $('sumatra-path').textContent = status.path;
+  $('download-sumatra').disabled = status.ready || status.downloading || downloadPending;
+  $('download-sumatra').textContent = status.ready ? '已安装' : status.downloading || downloadPending ? '正在下载…' : '下载打印组件';
+}
+$('refresh-sumatra').addEventListener('click', () => action(refreshSumatra));
+$('download-sumatra').addEventListener('click', async () => {
+  if (downloadPending) return;
+  downloadPending = true;
+  $('download-sumatra').disabled = true;
+  $('download-sumatra').textContent = '正在下载…';
+  $('sumatra-state').textContent = '正在从官方网站下载并校验，请稍候…';
+  try {
+    await invoke('download_sumatra');
+    message('打印组件已下载并校验，可启动真实打印服务。');
+  } catch (error) { message(`下载失败：${String(error)}`, true); }
+  finally { downloadPending = false; await refreshSumatra().catch((error) => message(String(error), true)); }
+});
 $('dismiss-secret').addEventListener('click', hideSecret);
 $('device-form').addEventListener('submit', (event) => { event.preventDefault(); action(async () => {
   hideSecret();
@@ -150,6 +172,6 @@ window.addEventListener('pagehide', hideSecret);
 if (window.__TAURI__) action(async () => {
   await window.__TAURI__.event.listen('hide-secret', hideSecret);
   await window.__TAURI__.event.listen('exit-blocked', async ({ payload }) => { hideSecret(); message(payload, true); await refreshStatus(); });
-  await refreshStatus(); await refreshPrinters(); await refreshDevices(); await refreshJobs(); await refreshQueues();
+  await refreshStatus(); await refreshPrinters(); await refreshDevices(); await refreshJobs(); await refreshQueues(); await refreshSumatra();
 });
 else { $('start').disabled = true; message('请从 Windows 桌面应用打开此界面。浏览器预览不连接打印服务。', true); }

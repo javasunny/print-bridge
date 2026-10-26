@@ -1,0 +1,20 @@
+SumatraPDF 3.6.1 x64 portable
+Copyright the SumatraPDF authors and contributing third-party projects.
+Project: https://github.com/sumatrapdfreader/sumatrapdf
+Release source: tag 3.6.1rel
+
+This product invokes the unmodified SumatraPDF executable as a separate process.
+SumatraPDF is distributed under GNU GPL version 3; see COPYING. Additional
+notices, authorship and component licenses are preserved in COPYING.BSD,
+AUTHORS and the complete SumatraPDF-source.zip archive supplied here.
+
+Corresponding source is included with this distribution in SumatraPDF-source.zip,
+including build files and bundled dependency sources. It is not replaced by a
+link to the upstream project. See the source archive's readme and docs for build
+instructions. No SumatraPDF source modifications have been made by this project.
+
+Do not distribute only SumatraPDF.exe. Preserve this entire resource directory.
+Before publishing a release, verify the packaged binary matches the release
+manifest, all source/build inputs are present, and required component notices
+remain available. The preparation script does not establish legal clearance
+for any other dependencies or future modifications.

@@ -1,0 +1,961 @@
+use crate::{
+    ipp::*,
+    store::{Bridge, Job, SharedPrinter, MAX_PDF},
+};
+use axum::{
+    body::to_bytes,
+    extract::{Request, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
+    Router,
+};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
+use tokio::sync::Semaphore;
+
+#[derive(Clone)]
+struct Server {
+    bridge: Arc<Bridge>,
+    uploads: Arc<Semaphore>,
+}
+pub(crate) fn router(bridge: Arc<Bridge>) -> Router {
+    Router::new()
+        .route("/ipp/printers/{printer}", post(handle))
+        .route("/ipp/printers/{printer}/jobs/{job}", post(handle))
+        .with_state(Server {
+            bridge,
+            uploads: Arc::new(Semaphore::new(4)),
+        })
+}
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            "Basic realm=\"Print Bridge\", charset=\"UTF-8\"",
+        )],
+        "Authentication required",
+    )
+        .into_response()
+}
+async fn handle(State(server): State<Server>, request: Request) -> Response {
+    if !server.bridge.running.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let auth = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Basic "))
+        .and_then(|s| STANDARD.decode(s).ok())
+        .and_then(|b| String::from_utf8(b).ok());
+    let Some((device, token)) = auth.as_deref().and_then(|s| s.split_once(':')) else {
+        return unauthorized();
+    };
+    if !server.bridge.authenticate(device, token) {
+        return unauthorized();
+    }
+    if request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|s| s.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or("").trim())
+        != Some("application/ipp")
+    {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let Ok(permit) = server.uploads.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let device = device.to_string();
+    let path = request.uri().path().to_string();
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .filter(|h| {
+            !h.is_empty()
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".:-[]".contains(&b))
+        })
+        .unwrap_or("localhost")
+        .to_string();
+    let body = match tokio::time::timeout(
+        Duration::from_secs(300),
+        to_bytes(request.into_body(), MAX_PDF + MAX_ATTRIBUTE_BYTES + 8),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    let bridge = server.bridge;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        dispatch(&bridge, &device, &host, &path, &body)
+    })
+    .await
+    {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "application/ipp")], bytes).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+fn reply(message: &Message<'_>, code: u16, extra: Vec<Group>, detail: &str) -> Vec<u8> {
+    let mut op = operation_attributes();
+    if !detail.is_empty() {
+        op.attributes
+            .push(Attribute::text(TEXT, "status-message", detail));
+    }
+    let mut groups = vec![op];
+    groups.extend(extra);
+    encode((1, 1), code, message.request_id, &groups, &[]).expect("bounded response")
+}
+fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8]) -> Vec<u8> {
+    let message = match parse(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            let id = bytes
+                .get(4..8)
+                .and_then(|s| s.try_into().ok())
+                .map(i32::from_be_bytes)
+                .filter(|n| *n > 0)
+                .unwrap_or(1);
+            return encode(
+                (1, 1),
+                CLIENT_ERROR_BAD_REQUEST,
+                id,
+                &[operation_attributes()],
+                &[],
+            )
+            .unwrap();
+        }
+    };
+    let fail = |code, detail: &str| reply(&message, code, vec![], detail);
+    if message.version != (1, 1) {
+        return fail(
+            SERVER_ERROR_VERSION_NOT_SUPPORTED,
+            "Only IPP 1.1 is supported",
+        );
+    }
+    if text(&message, "attributes-charset") != Some("utf-8")
+        || text(&message, "attributes-natural-language").is_none()
+    {
+        return fail(CLIENT_ERROR_BAD_REQUEST, "Missing charset or language");
+    }
+    for name in [
+        "printer-uri",
+        "job-uri",
+        "job-id",
+        "copies",
+        "sides",
+        "media",
+        "document-format",
+    ] {
+        if message.attributes(name).count() > 1 {
+            return fail(
+                CLIENT_ERROR_BAD_REQUEST,
+                "Duplicate single-valued attribute",
+            );
+        }
+    }
+    for (name, tag) in [
+        ("printer-uri", URI),
+        ("job-uri", URI),
+        ("attributes-charset", CHARSET),
+        ("attributes-natural-language", NATURAL_LANGUAGE),
+        ("which-jobs", KEYWORD),
+    ] {
+        if message
+            .attribute(name)
+            .is_some_and(|a| a.tag != tag || a.as_str().is_none())
+        {
+            return fail(CLIENT_ERROR_BAD_REQUEST, "Invalid attribute type");
+        }
+    }
+    for name in ["job-id", "limit"] {
+        if message
+            .attribute(name)
+            .is_some_and(|a| a.tag != INTEGER || a.as_i32().is_none_or(|n| n <= 0))
+        {
+            return fail(CLIENT_ERROR_BAD_REQUEST, "Invalid integer attribute");
+        }
+    }
+    let parts: Vec<_> = path.split('/').collect();
+    let Some(printer_id) = parts.get(3) else {
+        return fail(CLIENT_ERROR_NOT_FOUND, "Unknown printer");
+    };
+    let printer = match bridge.printer(printer_id) {
+        Ok(p) => p,
+        Err(_) => return fail(CLIENT_ERROR_NOT_FOUND, "Unknown printer"),
+    };
+    let printer_path = format!("/ipp/printers/{}", printer.id);
+    let uri = format!("ipp://{host}{printer_path}");
+    if let Some(value) = text(&message, "printer-uri") {
+        if uri_path(value) != Some(printer_path.as_str()) {
+            return fail(CLIENT_ERROR_BAD_REQUEST, "Printer URI does not match route");
+        }
+    } else if text(&message, "job-uri").is_none() {
+        return fail(CLIENT_ERROR_BAD_REQUEST, "Missing target URI");
+    }
+    if message.code != PRINT_JOB && !message.document.is_empty() {
+        return fail(CLIENT_ERROR_BAD_REQUEST, "Unexpected document");
+    }
+    match message.code {
+        GET_PRINTER_ATTRIBUTES => reply(
+            &message,
+            SUCCESSFUL_OK,
+            vec![printer_group(&printer, &uri)],
+            "",
+        ),
+        VALIDATE_JOB | PRINT_JOB => {
+            if parts.len() != 4 {
+                return fail(CLIENT_ERROR_BAD_REQUEST, "Expected printer route");
+            }
+            if !printer.enabled {
+                return fail(SERVER_ERROR_SERVICE_UNAVAILABLE, "Printer disabled");
+            }
+            let (copies, sides) = match options(&message, &printer) {
+                Ok(o) => o,
+                Err((code, s)) => return fail(code, s),
+            };
+            if message.code == VALIDATE_JOB {
+                return reply(&message, SUCCESSFUL_OK, vec![], "");
+            }
+            match bridge.accept(device, &printer.id, copies, sides, message.document) {
+                Ok(job) => reply(&message, SUCCESSFUL_OK, vec![job_group(&job, &uri)], ""),
+                Err(_) => fail(
+                    CLIENT_ERROR_NOT_POSSIBLE,
+                    "PDF validation, capacity or current printer/device state rejected this job",
+                ),
+            }
+        }
+        GET_JOB_ATTRIBUTES | CANCEL_JOB => {
+            let attr_id = message
+                .attribute("job-id")
+                .and_then(|a| a.as_i32())
+                .map(i64::from);
+            let uri_id = text(&message, "job-uri")
+                .and_then(uri_path)
+                .and_then(|p| p.strip_prefix(&format!("{printer_path}/jobs/")))
+                .and_then(|s| s.parse::<i64>().ok());
+            let route_id = parts.get(5).and_then(|s| s.parse::<i64>().ok());
+            let Some(id) = attr_id.or(uri_id).or(route_id) else {
+                return fail(CLIENT_ERROR_BAD_REQUEST, "Missing job ID");
+            };
+            if attr_id.is_some_and(|n| n != id)
+                || uri_id.is_some_and(|n| n != id)
+                || route_id.is_some_and(|n| n != id)
+                || text(&message, "job-uri").is_some() && uri_id.is_none()
+            {
+                return fail(CLIENT_ERROR_BAD_REQUEST, "Conflicting job target");
+            }
+            let job = match bridge.job(id) {
+                Ok(j) if j.device_id == device && j.printer_id == printer.id => j,
+                _ => return fail(CLIENT_ERROR_NOT_FOUND, "Unknown job"),
+            };
+            if message.code == CANCEL_JOB {
+                return match bridge.cancel_job(id) {
+                    Ok(()) => reply(&message, SUCCESSFUL_OK, vec![], ""),
+                    Err(_) => fail(
+                        CLIENT_ERROR_NOT_POSSIBLE,
+                        "Only pending jobs can be canceled",
+                    ),
+                };
+            }
+            reply(&message, SUCCESSFUL_OK, vec![job_group(&job, &uri)], "")
+        }
+        GET_JOBS => {
+            let which = text(&message, "which-jobs").unwrap_or("not-completed");
+            if !matches!(which, "all" | "completed" | "not-completed") {
+                return fail(
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                    "Unsupported which-jobs",
+                );
+            }
+            let limit = message
+                .attribute("limit")
+                .and_then(|a| a.as_i32())
+                .unwrap_or(20);
+            if limit <= 0 {
+                return fail(
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                    "Invalid limit",
+                );
+            }
+            let jobs = match bridge.device_jobs(device, &printer.id, which, limit) {
+                Ok(j) => j,
+                Err(_) => return fail(SERVER_ERROR_INTERNAL_ERROR, "Storage unavailable"),
+            };
+            let groups = jobs.into_iter().map(|j| job_group(&j, &uri)).collect();
+            reply(&message, SUCCESSFUL_OK, groups, "")
+        }
+        _ => fail(
+            SERVER_ERROR_OPERATION_NOT_SUPPORTED,
+            "Operation not supported",
+        ),
+    }
+}
+fn text<'a>(m: &'a Message<'_>, name: &str) -> Option<&'a str> {
+    m.attribute(name).and_then(Attribute::as_str)
+}
+fn uri_path(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("ipp://")?;
+    let (_, path) = rest.split_once('/')?;
+    Some(&rest[rest.len() - path.len() - 1..])
+}
+fn options<'a>(
+    m: &'a Message<'_>,
+    p: &SharedPrinter,
+) -> Result<(u32, &'a str), (u16, &'static str)> {
+    for (name, tag) in [
+        ("document-format", MIME_MEDIA_TYPE),
+        ("sides", KEYWORD),
+        ("media", KEYWORD),
+    ] {
+        if m.attribute(name)
+            .is_some_and(|a| a.tag != tag || a.as_str().is_none())
+        {
+            return Err((
+                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                "Invalid print attribute type",
+            ));
+        }
+    }
+    if text(m, "compression").is_some_and(|s| s != "none") {
+        return Err((
+            CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+            "Compression not supported",
+        ));
+    }
+    for group in &m.groups {
+        if group.tag == JOB_ATTRIBUTES
+            && group
+                .attributes
+                .iter()
+                .any(|a| !matches!(a.name.as_str(), "copies" | "sides" | "media"))
+        {
+            return Err((
+                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                "Unsupported job attribute",
+            ));
+        }
+    }
+    if text(m, "document-format").unwrap_or("application/pdf") != "application/pdf" {
+        return Err((
+            CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED,
+            "Only application/pdf is supported",
+        ));
+    }
+    let copies = match m.attribute("copies") {
+        Some(a) if a.tag == INTEGER => a.as_i32().filter(|n| *n > 0).ok_or((
+            CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+            "Invalid copies",
+        ))? as u32,
+        Some(_) => {
+            return Err((
+                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                "Invalid copies",
+            ))
+        }
+        None => 1,
+    };
+    let sides = text(m, "sides").unwrap_or("one-sided");
+    if text(m, "media").is_some_and(|s| s != "iso_a4_210x297mm") {
+        return Err((
+            CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+            "Only A4 is supported",
+        ));
+    }
+    for name in [
+        "page-ranges",
+        "number-up",
+        "orientation-requested",
+        "print-color-mode",
+        "media-col",
+        "printer-resolution",
+        "finishings",
+        "output-bin",
+        "print-quality",
+    ] {
+        if m.attribute(name).is_some() {
+            return Err((
+                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                "Unsupported print option",
+            ));
+        }
+    }
+    Bridge::validate_options(p, copies, sides).map_err(|_| {
+        (
+            CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+            "Unsupported copies or sides",
+        )
+    })?;
+    Ok((copies, sides))
+}
+fn printer_group(p: &SharedPrinter, uri: &str) -> Group {
+    let mut a = vec![
+        Attribute::text(URI, "printer-uri-supported", uri),
+        Attribute::text(KEYWORD, "uri-authentication-supported", "basic"),
+        Attribute::text(KEYWORD, "uri-security-supported", "none"),
+        Attribute::text(NAME, "printer-name", &p.name),
+        Attribute::text(TEXT, "printer-info", &p.name),
+        Attribute::text(TEXT, "printer-make-and-model", "Print Bridge PDF gateway"),
+        Attribute::integer(ENUM, "printer-state", if p.enabled { 3 } else { 5 }),
+        Attribute::text(
+            KEYWORD,
+            "printer-state-reasons",
+            if p.enabled { "none" } else { "paused" },
+        ),
+        Attribute::boolean("printer-is-accepting-jobs", p.enabled),
+        Attribute::text(KEYWORD, "ipp-versions-supported", "1.1"),
+        Attribute::text(CHARSET, "charset-configured", "utf-8"),
+        Attribute::text(CHARSET, "charset-supported", "utf-8"),
+        Attribute::text(NATURAL_LANGUAGE, "natural-language-configured", "en"),
+        Attribute::text(
+            NATURAL_LANGUAGE,
+            "generated-natural-language-supported",
+            "en",
+        ),
+        Attribute::text(
+            MIME_MEDIA_TYPE,
+            "document-format-supported",
+            "application/pdf",
+        ),
+        Attribute::text(
+            MIME_MEDIA_TYPE,
+            "document-format-default",
+            "application/pdf",
+        ),
+        Attribute::text(KEYWORD, "media-supported", "iso_a4_210x297mm"),
+        Attribute::text(KEYWORD, "media-default", "iso_a4_210x297mm"),
+        Attribute::text(KEYWORD, "sides-default", "one-sided"),
+        Attribute::integer(INTEGER, "copies-default", 1),
+        Attribute::boolean("multiple-document-jobs-supported", false),
+        Attribute::text(KEYWORD, "compression-supported", "none"),
+    ];
+    a.push(Attribute {
+        tag: RANGE_OF_INTEGER,
+        name: "copies-supported".into(),
+        value: [1i32.to_be_bytes(), (p.max_copies as i32).to_be_bytes()].concat(),
+    });
+    for op in [
+        PRINT_JOB,
+        VALIDATE_JOB,
+        CANCEL_JOB,
+        GET_JOB_ATTRIBUTES,
+        GET_JOBS,
+        GET_PRINTER_ATTRIBUTES,
+    ] {
+        a.push(Attribute::integer(ENUM, "operations-supported", op as i32));
+    }
+    a.push(Attribute::text(KEYWORD, "sides-supported", "one-sided"));
+    if p.duplex {
+        for s in ["two-sided-long-edge", "two-sided-short-edge"] {
+            a.push(Attribute::text(KEYWORD, "sides-supported", s));
+        }
+    }
+    Group::new(PRINTER_ATTRIBUTES, a)
+}
+fn job_group(j: &Job, printer_uri: &str) -> Group {
+    let (state, reason) = match j.state.as_str() {
+        "pending" => (3, "none"),
+        "processing" => (5, "job-printing"),
+        "submitted" => (9, "queued-in-device"),
+        "simulated" => (9, "job-completed-successfully"),
+        "failed" => (8, "aborted-by-system"),
+        "uncertain" => (6, "job-stopped"),
+        "canceled" => (7, "job-canceled-by-user"),
+        _ => (6, "job-stopped"),
+    };
+    Group::new(
+        JOB_ATTRIBUTES,
+        vec![
+            Attribute::integer(INTEGER, "job-id", j.id as i32),
+            Attribute::text(URI, "job-uri", &format!("{printer_uri}/jobs/{}", j.id)),
+            Attribute::text(URI, "job-printer-uri", printer_uri),
+            Attribute::integer(ENUM, "job-state", state),
+            Attribute::text(KEYWORD, "job-state-reasons", reason),
+            Attribute::text(TEXT, "job-state-message", &j.detail),
+            Attribute::text(NAME, "job-originating-user-name", &j.device_id),
+            Attribute::integer(INTEGER, "copies", j.copies as i32),
+            Attribute::text(KEYWORD, "sides", &j.sides),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{
+        tests::{fixture, pdf_bytes},
+        CreatedDevice,
+    };
+    use axum::body::{Body, Bytes};
+    use std::{
+        convert::Infallible,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tower::ServiceExt;
+
+    struct UnreadBody;
+    impl http_body::Body for UnreadBody {
+        type Data = Bytes;
+        type Error = Infallible;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            panic!("authentication must complete before reading the body")
+        }
+    }
+
+    fn request_bytes(operation: u16, printer: &str, extra: Vec<Attribute>, pdf: &[u8]) -> Vec<u8> {
+        let mut group = operation_attributes();
+        group.attributes.push(Attribute::text(
+            URI,
+            "printer-uri",
+            &format!("ipp://localhost/ipp/printers/{printer}"),
+        ));
+        group.attributes.extend(extra);
+        encode((1, 1), operation, 17, &[group], pdf).unwrap()
+    }
+
+    async fn call(
+        bridge: &Arc<Bridge>,
+        device: &CreatedDevice,
+        printer: &str,
+        operation: u16,
+        attributes: Vec<Attribute>,
+        pdf: &[u8],
+    ) -> Vec<u8> {
+        let auth = STANDARD.encode(format!("{}:{}", device.device.id, device.token));
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/ipp/printers/{printer}"))
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/ipp")
+            .header(header::AUTHORIZATION, format!("Basic {auth}"))
+            .body(Body::from(request_bytes(
+                operation, printer, attributes, pdf,
+            )))
+            .unwrap();
+        let response = router(Arc::clone(bridge)).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/ipp");
+        to_bytes(response.into_body(), MAX_PDF)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[test]
+    fn rejects_missing_wrong_and_revoked_credentials_without_reading_body() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            for auth in [
+                None,
+                Some(STANDARD.encode(format!("{}:wrong", device.device.id))),
+            ] {
+                let mut request = Request::builder()
+                    .method("POST")
+                    .uri("/ipp/printers/office")
+                    .header(header::CONTENT_TYPE, "application/ipp");
+                if let Some(auth) = auth {
+                    request = request.header(header::AUTHORIZATION, format!("Basic {auth}"));
+                }
+                let response = router(Arc::clone(&bridge))
+                    .oneshot(request.body(Body::new(UnreadBody)).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+            }
+            bridge.revoke_device(&device.device.id).unwrap();
+            let auth = STANDARD.encode(format!("{}:{}", device.device.id, device.token));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ipp/printers/office")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .header(header::AUTHORIZATION, format!("Basic {auth}"))
+                .body(Body::new(UnreadBody))
+                .unwrap();
+            let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(bridge.list_jobs().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn capabilities_and_validate_job_advertise_only_supported_operations() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                GET_PRINTER_ATTRIBUTES,
+                vec![],
+                &[],
+            )
+            .await;
+            let response = parse(&bytes).unwrap();
+            assert_eq!(response.code, SUCCESSFUL_OK);
+            assert_eq!(response.request_id, 17);
+            let mut operations: Vec<_> = response
+                .attributes("operations-supported")
+                .map(|a| a.as_i32().unwrap() as u16)
+                .collect();
+            operations.sort();
+            assert_eq!(
+                operations,
+                vec![
+                    PRINT_JOB,
+                    VALIDATE_JOB,
+                    CANCEL_JOB,
+                    GET_JOB_ATTRIBUTES,
+                    GET_JOBS,
+                    GET_PRINTER_ATTRIBUTES
+                ]
+            );
+            assert_eq!(
+                text(&response, "document-format-supported"),
+                Some("application/pdf")
+            );
+            assert_eq!(
+                text(&response, "uri-authentication-supported"),
+                Some("basic")
+            );
+            assert_eq!(response.attributes("sides-supported").count(), 3);
+            // Multi-valued attributes must use one name followed by zero-name values.
+            assert_eq!(
+                bytes
+                    .windows(b"sides-supported".len())
+                    .filter(|s| *s == b"sides-supported")
+                    .count(),
+                1
+            );
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                VALIDATE_JOB,
+                vec![Attribute::integer(INTEGER, "copies", 2)],
+                &[],
+            )
+            .await;
+            assert_eq!(parse(&bytes).unwrap().code, SUCCESSFUL_OK);
+            assert!(bridge.list_jobs().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn submits_queries_and_cancels_pending_job_without_printing() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                PRINT_JOB,
+                vec![Attribute::integer(INTEGER, "copies", 2)],
+                &pdf_bytes(),
+            )
+            .await;
+            let submitted = parse(&bytes).unwrap();
+            assert_eq!(submitted.code, SUCCESSFUL_OK);
+            let id = submitted.attribute("job-id").unwrap().as_i32().unwrap();
+            assert_eq!(submitted.attribute("job-state").unwrap().as_i32(), Some(3));
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                GET_JOB_ATTRIBUTES,
+                vec![Attribute::integer(INTEGER, "job-id", id)],
+                &[],
+            )
+            .await;
+            assert_eq!(
+                parse(&bytes).unwrap().attribute("copies").unwrap().as_i32(),
+                Some(2)
+            );
+            let bytes = call(&bridge, &device, "office", GET_JOBS, vec![], &[]).await;
+            assert_eq!(parse(&bytes).unwrap().attributes("job-id").count(), 1);
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                CANCEL_JOB,
+                vec![Attribute::integer(INTEGER, "job-id", id)],
+                &[],
+            )
+            .await;
+            assert_eq!(parse(&bytes).unwrap().code, SUCCESSFUL_OK);
+            assert_eq!(bridge.job(id as i64).unwrap().state, "canceled");
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                CANCEL_JOB,
+                vec![Attribute::integer(INTEGER, "job-id", id)],
+                &[],
+            )
+            .await;
+            assert_eq!(parse(&bytes).unwrap().code, CLIENT_ERROR_NOT_POSSIBLE);
+        });
+    }
+
+    #[test]
+    fn isolates_queries_and_cancellation_by_device_and_printer() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let other = bridge.create_device("Other Mac".into()).unwrap();
+            let mut printer = bridge.printer("office").unwrap();
+            printer.id = "warehouse".into();
+            printer.queue = "Queue B".into();
+            bridge.save_printer(printer).unwrap();
+            let bytes = call(&bridge, &device, "office", PRINT_JOB, vec![], &pdf_bytes()).await;
+            let id = parse(&bytes)
+                .unwrap()
+                .attribute("job-id")
+                .unwrap()
+                .as_i32()
+                .unwrap();
+            for operation in [GET_JOB_ATTRIBUTES, CANCEL_JOB] {
+                for (who, printer) in [(&other, "office"), (&device, "warehouse")] {
+                    let bytes = call(
+                        &bridge,
+                        who,
+                        printer,
+                        operation,
+                        vec![Attribute::integer(INTEGER, "job-id", id)],
+                        &[],
+                    )
+                    .await;
+                    assert_eq!(parse(&bytes).unwrap().code, CLIENT_ERROR_NOT_FOUND);
+                }
+            }
+            let bytes = call(
+                &bridge,
+                &other,
+                "office",
+                GET_JOBS,
+                vec![Attribute::text(KEYWORD, "which-jobs", "all")],
+                &[],
+            )
+            .await;
+            assert_eq!(parse(&bytes).unwrap().attributes("job-id").count(), 0);
+            assert_eq!(bridge.job(id as i64).unwrap().state, "pending");
+        });
+    }
+
+    #[test]
+    fn rejects_formats_options_unknown_operations_and_conflicting_uris() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            for (attribute, status) in [
+                (
+                    Attribute::text(MIME_MEDIA_TYPE, "document-format", "image/pwg-raster"),
+                    CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::integer(INTEGER, "copies", 0),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::text(KEYWORD, "media", "na_letter_8.5x11in"),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::text(KEYWORD, "sides", "invalid"),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+                (
+                    Attribute::integer(INTEGER, "number-up", 2),
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                ),
+            ] {
+                let bytes = call(
+                    &bridge,
+                    &device,
+                    "office",
+                    PRINT_JOB,
+                    vec![attribute],
+                    &pdf_bytes(),
+                )
+                .await;
+                assert_eq!(parse(&bytes).unwrap().code, status);
+            }
+            let bytes = call(&bridge, &device, "office", 0x0005, vec![], &[]).await;
+            assert_eq!(
+                parse(&bytes).unwrap().code,
+                SERVER_ERROR_OPERATION_NOT_SUPPORTED
+            );
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                GET_JOB_ATTRIBUTES,
+                vec![
+                    Attribute::integer(INTEGER, "job-id", 1),
+                    Attribute::text(URI, "job-uri", "ipp://localhost/ipp/printers/office/jobs/2"),
+                ],
+                &[],
+            )
+            .await;
+            assert_eq!(parse(&bytes).unwrap().code, CLIENT_ERROR_BAD_REQUEST);
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                PRINT_JOB,
+                vec![],
+                b"%PDF-1.7 broken",
+            )
+            .await;
+            assert_ne!(parse(&bytes).unwrap().code, SUCCESSFUL_OK);
+            assert!(bridge.list_jobs().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn intentional_identical_submissions_remain_distinct_jobs() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let pdf = pdf_bytes();
+            let first = call(&bridge, &device, "office", PRINT_JOB, vec![], &pdf).await;
+            let second = call(&bridge, &device, "office", PRINT_JOB, vec![], &pdf).await;
+            let first = parse(&first)
+                .unwrap()
+                .attribute("job-id")
+                .unwrap()
+                .as_i32()
+                .unwrap();
+            let second = parse(&second)
+                .unwrap()
+                .attribute("job-id")
+                .unwrap()
+                .as_i32()
+                .unwrap();
+            assert_ne!(first, second);
+            assert_eq!(bridge.list_jobs().unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn rejects_wrong_tags_and_invalid_utf8_in_explicit_attributes() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            for attribute in [
+                Attribute {
+                    tag: KEYWORD,
+                    name: "sides".into(),
+                    value: vec![0xff],
+                },
+                Attribute::integer(INTEGER, "sides", 1),
+                Attribute::text(NAME, "media", "iso_a4_210x297mm"),
+                Attribute::text(KEYWORD, "document-format", "application/pdf"),
+                Attribute::text(KEYWORD, "copies", "1"),
+            ] {
+                let bytes = call(
+                    &bridge,
+                    &device,
+                    "office",
+                    PRINT_JOB,
+                    vec![attribute],
+                    &pdf_bytes(),
+                )
+                .await;
+                assert_eq!(
+                    parse(&bytes).unwrap().code,
+                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED
+                );
+            }
+            for (operation, attribute) in [
+                (GET_JOB_ATTRIBUTES, Attribute::text(KEYWORD, "job-id", "1")),
+                (GET_JOBS, Attribute::text(NAME, "which-jobs", "all")),
+                (GET_JOBS, Attribute::text(KEYWORD, "limit", "1")),
+            ] {
+                let bytes = call(&bridge, &device, "office", operation, vec![attribute], &[]).await;
+                assert_eq!(parse(&bytes).unwrap().code, CLIENT_ERROR_BAD_REQUEST);
+            }
+            assert!(bridge.list_jobs().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn validates_without_a_document_but_rejects_unknown_job_attributes() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let bytes = call(&bridge, &device, "office", VALIDATE_JOB, vec![], &[]).await;
+            assert_eq!(parse(&bytes).unwrap().code, SUCCESSFUL_OK);
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                VALIDATE_JOB,
+                vec![],
+                &pdf_bytes(),
+            )
+            .await;
+            assert_eq!(parse(&bytes).unwrap().code, CLIENT_ERROR_BAD_REQUEST);
+            let mut operation = operation_attributes();
+            operation.attributes.push(Attribute::text(
+                URI,
+                "printer-uri",
+                "ipp://localhost/ipp/printers/office",
+            ));
+            let job = Group::new(
+                JOB_ATTRIBUTES,
+                vec![Attribute::text(
+                    KEYWORD,
+                    "unsupported-job-setting",
+                    "enabled",
+                )],
+            );
+            let auth = STANDARD.encode(format!("{}:{}", device.device.id, device.token));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ipp/printers/office")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .header(header::AUTHORIZATION, format!("Basic {auth}"))
+                .body(Body::from(
+                    encode((1, 1), PRINT_JOB, 18, &[operation, job], &pdf_bytes()).unwrap(),
+                ))
+                .unwrap();
+            let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), MAX_PDF).await.unwrap();
+            assert_eq!(
+                parse(&bytes).unwrap().code,
+                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED
+            );
+            assert!(bridge.list_jobs().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn stopped_service_rejects_new_requests_without_reading_the_document() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            bridge.stop().unwrap();
+            let auth = STANDARD.encode(format!("{}:{}", device.device.id, device.token));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/ipp/printers/office")
+                .header(header::CONTENT_TYPE, "application/ipp")
+                .header(header::AUTHORIZATION, format!("Basic {auth}"))
+                .body(Body::new(UnreadBody))
+                .unwrap();
+            let response = router(Arc::clone(&bridge)).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(bridge.list_jobs().unwrap().is_empty());
+        });
+    }
+}

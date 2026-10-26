@@ -1,0 +1,6 @@
+{
+  "identifier": "main-window",
+  "description": "Local printer management window only",
+  "windows": ["main"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

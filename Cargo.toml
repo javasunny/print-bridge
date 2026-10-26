@@ -8,7 +8,9 @@ axum = "0.8"
 base64 = "0.22"
 fs2 = "0.4"
 http-body-util = "0.1"
+jpeg-decoder = { version = "0.3", default-features = false }
 lopdf = "0.38"
+mdns-sd = "0.21.6"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -22,6 +22,7 @@ use subtle::ConstantTimeEq;
 
 pub(crate) const MAX_PDF: usize = 100 * 1024 * 1024;
 pub(crate) const ANONYMOUS_DEVICE: &str = "anonymous";
+const IPP_DOCUMENT_TIMEOUT_SECS: i64 = 120;
 const QUOTA: u64 = 2 * 1024 * 1024 * 1024;
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
@@ -75,6 +76,7 @@ pub struct Job {
     pub copies: u32,
     pub sides: String,
     pub paper: PaperSize,
+    pub color_mode: String,
     pub state: String,
     pub detail: String,
     pub created_at: i64,
@@ -95,6 +97,8 @@ pub struct ServiceStatus {
     pub running: bool,
     pub simulation: bool,
     pub address: Option<String>,
+    pub discovery_active: bool,
+    pub discovery_error: Option<String>,
     pub authentication_required: bool,
     pub active_authentication_required: bool,
     pub authentication_restart_required: bool,
@@ -109,6 +113,8 @@ pub struct Bridge {
     configured_authentication_required: AtomicBool,
     connection_events: Mutex<VecDeque<ConnectionEvent>>,
     service: Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>,
+    discovery: Mutex<Option<crate::discovery::Discovery>>,
+    discovery_start_error: Mutex<Option<String>>,
     worker_active: AtomicBool,
     server_active: AtomicBool,
     _lock: File,
@@ -135,20 +141,25 @@ impl Bridge {
             CREATE TABLE IF NOT EXISTS printers(id TEXT PRIMARY KEY, config TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY,name TEXT NOT NULL,hash TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,printer_id TEXT NOT NULL,queue TEXT NOT NULL,copies INTEGER NOT NULL,sides TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,file TEXT NOT NULL,digest TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,printer_id TEXT NOT NULL,queue TEXT NOT NULL,copies INTEGER NOT NULL,sides TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,file TEXT NOT NULL,digest TEXT NOT NULL,color_mode TEXT NOT NULL DEFAULT 'auto');
             CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state,id);").map_err(err)?;
-        let has_paper = db
+        let columns = db
             .prepare("PRAGMA table_info(jobs)")
             .map_err(err)?
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(err)?
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(err)?
-            .iter()
-            .any(|column| column == "paper");
-        if !has_paper {
+            .map_err(err)?;
+        if !columns.iter().any(|column| column == "paper") {
             db.execute(
                 "ALTER TABLE jobs ADD COLUMN paper TEXT NOT NULL DEFAULT 'A4'",
+                [],
+            )
+            .map_err(err)?;
+        }
+        if !columns.iter().any(|column| column == "color_mode") {
+            db.execute(
+                "ALTER TABLE jobs ADD COLUMN color_mode TEXT NOT NULL DEFAULT 'auto'",
                 [],
             )
             .map_err(err)?;
@@ -175,6 +186,8 @@ impl Bridge {
             configured_authentication_required: AtomicBool::new(authentication_required),
             connection_events: Mutex::new(VecDeque::new()),
             service: Mutex::new(None),
+            discovery: Mutex::new(None),
+            discovery_start_error: Mutex::new(None),
             worker_active: AtomicBool::new(false),
             server_active: AtomicBool::new(false),
             _lock: lock,
@@ -198,7 +211,9 @@ impl Bridge {
         for row in rows {
             let (id, file, state) = row.map_err(err)?;
             known.insert(file.clone());
-            if state == "pending" && !self.root.join("documents").join(&file).is_file() {
+            if matches!(state.as_str(), "pending" | "pending-final-document")
+                && !self.root.join("documents").join(&file).is_file()
+            {
                 db.execute("UPDATE jobs SET state='failed',detail='恢复时文档缺失',updated_at=? WHERE id=?",params![now(),id]).map_err(err)?;
             }
         }
@@ -256,14 +271,45 @@ impl Bridge {
                 return Err("此 Windows 队列已有共享绑定".into());
             }
             if old.id == p.id && old.queue != p.queue {
-                let n:i64=db.query_row("SELECT COUNT(*) FROM jobs WHERE printer_id=? AND state IN ('pending','processing','uncertain')",[&p.id],|r|r.get(0)).map_err(err)?;
+                let n:i64=db.query_row("SELECT COUNT(*) FROM jobs WHERE printer_id=? AND state IN ('pending','pending-document','pending-final-document','processing','uncertain')",[&p.id],|r|r.get(0)).map_err(err)?;
                 if n > 0 {
                     return Err("请先处理原绑定的未完成任务".into());
                 }
             }
         }
         db.execute("INSERT INTO printers(id,config) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET config=excluded.config",params![p.id,serde_json::to_string(&p).map_err(err)?]).map_err(err)?;
+        drop(stmt);
+        drop(db);
+        self.refresh_discovery();
         Ok(())
+    }
+    fn refresh_discovery(&self) {
+        let service = self.service.lock().unwrap();
+        let Some(address) = service
+            .as_ref()
+            .and_then(|(address, _)| address.parse::<std::net::SocketAddr>().ok())
+        else {
+            return;
+        };
+        if !self.running.load(Ordering::SeqCst) {
+            return;
+        }
+        let auth = self.authentication_required();
+        let old = self.discovery.lock().unwrap().take();
+        drop(old);
+        let result = self
+            .list_printers()
+            .and_then(|printers| crate::discovery::Discovery::start(&printers, address, auth));
+        match result {
+            Ok(discovery) => {
+                *self.discovery.lock().unwrap() = Some(discovery);
+                *self.discovery_start_error.lock().unwrap() = None;
+            }
+            Err(error) => {
+                *self.discovery.lock().unwrap() = None;
+                *self.discovery_start_error.lock().unwrap() = Some(error);
+            }
+        }
     }
     pub fn create_device(&self, name: String) -> Result<CreatedDevice> {
         if name.trim().is_empty() || name.len() > 100 {
@@ -342,7 +388,7 @@ impl Bridge {
     }
     pub fn list_jobs(&self) -> Result<Vec<Job>> {
         let db = self.db.lock().unwrap();
-        let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper FROM jobs ORDER BY id DESC LIMIT 1000").map_err(err)?;
+        let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper,color_mode FROM jobs ORDER BY id DESC LIMIT 1000").map_err(err)?;
         let result = stmt
             .query_map([], job_row)
             .map_err(err)?
@@ -352,7 +398,7 @@ impl Bridge {
     }
     pub(crate) fn job(&self, id: i64) -> Result<Job> {
         let db = self.db.lock().unwrap();
-        db.query_row("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper FROM jobs WHERE id=?",[id],job_row).map_err(|_|"任务不存在".into())
+        db.query_row("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper,color_mode FROM jobs WHERE id=?",[id],job_row).map_err(|_|"任务不存在".into())
     }
     pub(crate) fn device_jobs(
         &self,
@@ -362,9 +408,9 @@ impl Bridge {
         limit: i32,
     ) -> Result<Vec<Job>> {
         let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper FROM jobs
+        let mut stmt = db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper,color_mode FROM jobs
             WHERE device_id=? AND printer_id=? AND (?='all' OR
-                CASE WHEN state IN ('submitted','simulated','failed','canceled') THEN 'completed' ELSE 'not-completed' END=?)
+                CASE WHEN state IN ('submitted','simulated','failed','canceled','completed') THEN 'completed' ELSE 'not-completed' END=?)
             ORDER BY id DESC LIMIT ?").map_err(err)?;
         let result = stmt
             .query_map(
@@ -388,7 +434,7 @@ impl Bridge {
             .map_err(err)
     }
     pub fn cancel_job(&self, id: i64) -> Result<()> {
-        let n=self.db.lock().unwrap().execute("UPDATE jobs SET state='canceled',detail='执行前取消',updated_at=? WHERE id=? AND state='pending'",params![now(),id]).map_err(err)?;
+        let n=self.db.lock().unwrap().execute("UPDATE jobs SET state='canceled',detail='执行前取消',updated_at=? WHERE id=? AND state IN ('pending','pending-document','pending-final-document')",params![now(),id]).map_err(err)?;
         if n == 1 {
             Ok(())
         } else {
@@ -400,6 +446,7 @@ impl Bridge {
         copies: u32,
         sides: &str,
         paper: PaperSize,
+        color_mode: &str,
     ) -> Result<()> {
         if !p.enabled {
             return Err("打印机已禁用".into());
@@ -415,8 +462,12 @@ impl Bridge {
         {
             return Err("不支持的单双面选项".into());
         }
+        if !matches!(color_mode, "auto" | "color" | "monochrome") {
+            return Err("不支持的颜色模式".into());
+        }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn accept(
         &self,
         device: &str,
@@ -424,9 +475,45 @@ impl Bridge {
         copies: u32,
         sides: &str,
         paper: PaperSize,
+        document: &[u8],
+    ) -> Result<Job> {
+        self.accept_format(
+            device,
+            printer,
+            copies,
+            sides,
+            paper,
+            "auto",
+            "application/pdf",
+            document,
+        )
+    }
+    pub(crate) fn accept_format(
+        &self,
+        device: &str,
+        printer: &str,
+        copies: u32,
+        sides: &str,
+        paper: PaperSize,
+        color_mode: &str,
+        mime: &str,
+        document: &[u8],
+    ) -> Result<Job> {
+        let pdf = crate::document::normalize(document, mime)
+            .map_err(|error| format!("文档格式错误：{error}"))?;
+        self.accept_pdf(device, printer, copies, sides, paper, color_mode, &pdf)
+    }
+    fn accept_pdf(
+        &self,
+        device: &str,
+        printer: &str,
+        copies: u32,
+        sides: &str,
+        paper: PaperSize,
+        color_mode: &str,
         pdf: &[u8],
     ) -> Result<Job> {
-        validate_pdf(pdf)?;
+        validate_pdf(pdf).map_err(|error| format!("文档格式错误：{error}"))?;
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(err)?;
         if !self.running.load(Ordering::SeqCst) {
@@ -448,9 +535,9 @@ impl Bridge {
             })
             .map_err(err)?;
         let p: SharedPrinter = serde_json::from_str(&config).map_err(err)?;
-        Self::validate_options(&p, copies, sides, paper)?;
-        let count:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE state IN ('pending','processing','uncertain') AND device_id=?",[device],|r|r.get(0)).map_err(err)?;
-        let queue_count:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE state IN ('pending','processing','uncertain') AND printer_id=?",[printer],|r|r.get(0)).map_err(err)?;
+        Self::validate_options(&p, copies, sides, paper, color_mode)?;
+        let count:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE state IN ('pending','pending-document','pending-final-document','processing','uncertain') AND device_id=?",[device],|r|r.get(0)).map_err(err)?;
+        let queue_count:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE state IN ('pending','pending-document','pending-final-document','processing','uncertain') AND printer_id=?",[printer],|r|r.get(0)).map_err(err)?;
         if count >= 20 || queue_count >= 100 {
             return Err("等待任务达到容量限制".into());
         }
@@ -474,7 +561,7 @@ impl Bridge {
             let _ = fs::remove_file(&path);
             return Err(err(e));
         }
-        let inserted=tx.execute("INSERT INTO jobs(device_id,printer_id,queue,copies,sides,paper,state,created_at,updated_at,file,digest) VALUES(?,?,?,?,?,?,'pending',?,?,?,?)",params![device,printer,p.queue,copies,sides,paper.name(),now(),now(),name,hash(pdf)]);
+        let inserted=tx.execute("INSERT INTO jobs(device_id,printer_id,queue,copies,sides,paper,color_mode,state,created_at,updated_at,file,digest) VALUES(?,?,?,?,?,?,?,'pending',?,?,?,?)",params![device,printer,p.queue,copies,sides,paper.name(),color_mode,now(),now(),name,hash(pdf)]);
         if let Err(e) = inserted {
             let _ = fs::remove_file(&path);
             return Err(err(e));
@@ -484,11 +571,241 @@ impl Bridge {
         drop(db);
         self.job(id)
     }
+    pub(crate) fn create_ipp_job(
+        &self,
+        device: &str,
+        printer: &str,
+        copies: u32,
+        sides: &str,
+        paper: PaperSize,
+        color_mode: &str,
+    ) -> Result<Job> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(err)?;
+        if !self.running.load(Ordering::SeqCst) {
+            return Err("服务未启动".into());
+        }
+        let active: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM devices WHERE id=? AND revoked=0)",
+                [device],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        if !active && !(device == ANONYMOUS_DEVICE && !self.authentication_required()) {
+            return Err("设备令牌已撤销".into());
+        }
+        let config: String = tx
+            .query_row("SELECT config FROM printers WHERE id=?", [printer], |r| {
+                r.get(0)
+            })
+            .map_err(err)?;
+        let p: SharedPrinter = serde_json::from_str(&config).map_err(err)?;
+        Self::validate_options(&p, copies, sides, paper, color_mode)?;
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state IN ('pending','pending-document','pending-final-document','processing','uncertain') AND device_id=?",
+                [device],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        let queue_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state IN ('pending','pending-document','pending-final-document','processing','uncertain') AND printer_id=?",
+                [printer],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        if count >= 20 || queue_count >= 100 {
+            return Err("等待任务达到容量限制".into());
+        }
+        let timestamp = now();
+        tx.execute(
+            "INSERT INTO jobs(device_id,printer_id,queue,copies,sides,paper,color_mode,state,detail,created_at,updated_at,file,digest) VALUES(?,?,?,?,?,?,?,'pending-document','等待文档',?,?,'','')",
+            params![device, printer, p.queue, copies, sides, paper.name(), color_mode, timestamp, timestamp],
+        )
+        .map_err(err)?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(err)?;
+        drop(db);
+        self.job(id)
+    }
+    pub(crate) fn send_ipp_document(
+        &self,
+        device: &str,
+        id: i64,
+        document: &[u8],
+        mime: &str,
+        last_document: bool,
+    ) -> Result<Job> {
+        if !last_document && document.is_empty() {
+            return Err("last-document=false 必须附带文档".into());
+        }
+        let pdf = if document.is_empty() {
+            None
+        } else {
+            let pdf = crate::document::normalize(document, mime)
+                .map_err(|error| format!("文档格式错误：{error}"))?;
+            validate_pdf(&pdf).map_err(|error| format!("文档格式错误：{error}"))?;
+            Some(pdf)
+        };
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(err)?;
+        let job = tx
+            .query_row(
+                "SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper,color_mode FROM jobs WHERE id=?",
+                [id],
+                job_row,
+            )
+            .optional()
+            .map_err(err)?
+            .ok_or_else(|| "任务不存在".to_string())?;
+        if job.device_id != device {
+            return Err("任务不存在".into());
+        }
+        self.validate_ipp_target(&tx, device, &job)?;
+        let updated_at: i64 = tx
+            .query_row("SELECT updated_at FROM jobs WHERE id=?", [id], |r| r.get(0))
+            .map_err(err)?;
+        if matches!(
+            job.state.as_str(),
+            "pending-document" | "pending-final-document"
+        ) && now() - updated_at > IPP_DOCUMENT_TIMEOUT_SECS
+        {
+            tx.execute(
+                "UPDATE jobs SET state='failed',detail='等待文档超时',updated_at=? WHERE id=?",
+                params![now(), id],
+            )
+            .map_err(err)?;
+            tx.commit().map_err(err)?;
+            return Err("等待文档超时".into());
+        }
+        let result = match (job.state.as_str(), pdf.as_deref(), last_document) {
+            ("pending-document", None, true) => {
+                tx.execute(
+                    "UPDATE jobs SET state='completed',detail='未提交文档',updated_at=? WHERE id=? AND state='pending-document'",
+                    params![now(), id],
+                )
+                .map_err(err)?;
+                None
+            }
+            ("pending-final-document", None, true) => {
+                tx.execute(
+                    "UPDATE jobs SET state='pending',detail='',updated_at=? WHERE id=? AND state='pending-final-document'",
+                    params![now(), id],
+                )
+                .map_err(err)?;
+                None
+            }
+            ("pending-document", Some(pdf), last_document) => {
+                let dir = self.root.join("documents");
+                let used = fs::read_dir(&dir)
+                    .map_err(err)?
+                    .try_fold(0u64, |sum, entry| {
+                        Ok::<_, String>(sum + entry.map_err(err)?.metadata().map_err(err)?.len())
+                    })?;
+                if used + pdf.len() as u64 > QUOTA
+                    || fs2::available_space(&dir).map_err(err)?
+                        < pdf.len() as u64 + 1024 * 1024 * 1024
+                {
+                    return Err("磁盘容量不足".into());
+                }
+                let file_name = format!("{}.pdf", random_hex());
+                let path = dir.join(&file_name);
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(err)?;
+                if let Err(error) = file.write_all(pdf).and_then(|_| file.sync_all()) {
+                    let _ = fs::remove_file(&path);
+                    return Err(err(error));
+                }
+                let next_state = if last_document {
+                    "pending"
+                } else {
+                    "pending-final-document"
+                };
+                let changed = tx.execute(
+                    "UPDATE jobs SET state=?,detail=?,updated_at=?,file=?,digest=? WHERE id=? AND state='pending-document'",
+                    params![next_state, if last_document { "" } else { "等待最后文档标记" }, now(), file_name, hash(pdf), id],
+                );
+                match changed {
+                    Ok(1) => Some(path),
+                    Ok(_) => {
+                        let _ = fs::remove_file(path);
+                        return Err("任务状态已变化".into());
+                    }
+                    Err(error) => {
+                        let _ = fs::remove_file(path);
+                        return Err(err(error));
+                    }
+                }
+            }
+            ("pending-final-document", Some(_), _) => {
+                return Err("不支持一个任务包含多个文档".into());
+            }
+            _ => return Err("Only a job awaiting a document can receive one".into()),
+        };
+        if let Err(error) = tx.commit() {
+            if let Some(path) = result {
+                let _ = fs::remove_file(path);
+            }
+            return Err(err(error));
+        }
+        drop(db);
+        self.job(id)
+    }
+    fn validate_ipp_target(
+        &self,
+        db: &rusqlite::Connection,
+        device: &str,
+        job: &Job,
+    ) -> Result<()> {
+        if !self.running.load(Ordering::SeqCst) {
+            return Err("服务未启动".into());
+        }
+        let active: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM devices WHERE id=? AND revoked=0)",
+                [device],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        if !active && !(device == ANONYMOUS_DEVICE && !self.authentication_required()) {
+            return Err("设备令牌已撤销".into());
+        }
+        let config: String = db
+            .query_row(
+                "SELECT config FROM printers WHERE id=?",
+                [&job.printer_id],
+                |r| r.get(0),
+            )
+            .map_err(err)?;
+        let printer: SharedPrinter = serde_json::from_str(&config).map_err(err)?;
+        if printer.queue != job.queue {
+            return Err("目标打印队列已变更".into());
+        }
+        Self::validate_options(&printer, job.copies, &job.sides, job.paper, &job.color_mode)?;
+        Ok(())
+    }
     pub fn status(&self) -> ServiceStatus {
+        let (discovery_active, discovery_error) = {
+            let discovery = self.discovery.lock().unwrap();
+            (
+                discovery.as_ref().is_some_and(|d| d.active()),
+                discovery
+                    .as_ref()
+                    .and_then(|d| d.error())
+                    .or_else(|| self.discovery_start_error.lock().unwrap().clone()),
+            )
+        };
         ServiceStatus {
             running: self.running.load(Ordering::SeqCst),
             simulation: self.simulation,
             address: self.service.lock().unwrap().as_ref().map(|x| x.0.clone()),
+            discovery_active,
+            discovery_error,
             authentication_required: self
                 .configured_authentication_required
                 .load(Ordering::SeqCst),
@@ -532,18 +849,32 @@ impl Bridge {
         }
         let listener = std::net::TcpListener::bind(addr).map_err(err)?;
         listener.set_nonblocking(true).map_err(err)?;
-        let bound = listener.local_addr().map_err(err)?.to_string();
+        let bound_addr = listener.local_addr().map_err(err)?;
+        let bound = bound_addr.to_string();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(err)?;
+        let authentication_required = self
+            .configured_authentication_required
+            .load(Ordering::SeqCst);
+        self.authentication_required
+            .store(authentication_required, Ordering::SeqCst);
+        let discovery_result = self.list_printers().and_then(|printers| {
+            crate::discovery::Discovery::start(&printers, bound_addr, authentication_required)
+        });
+        match discovery_result {
+            Ok(discovery) => {
+                *self.discovery.lock().unwrap() = Some(discovery);
+                *self.discovery_start_error.lock().unwrap() = None;
+            }
+            Err(error) => {
+                *self.discovery.lock().unwrap() = None;
+                *self.discovery_start_error.lock().unwrap() = Some(error);
+            }
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         *service = Some((bound, tx));
-        self.authentication_required.store(
-            self.configured_authentication_required
-                .load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
         self.running.store(true, Ordering::SeqCst);
         self.server_active.store(true, Ordering::SeqCst);
         let bridge = Arc::clone(self);
@@ -561,6 +892,7 @@ impl Bridge {
                 })
                 .await;
                 bridge.running.store(false, Ordering::SeqCst);
+                bridge.discovery.lock().unwrap().take();
                 bridge.server_active.store(false, Ordering::SeqCst);
             })
         });
@@ -582,6 +914,7 @@ impl Bridge {
         let mut service = self.service.lock().unwrap();
         let _db = self.db.lock().unwrap();
         self.running.store(false, Ordering::SeqCst);
+        self.discovery.lock().unwrap().take();
         if let Some((_, tx)) = service.take() {
             let _ = tx.send(());
         }
@@ -598,10 +931,10 @@ impl Bridge {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper,file FROM jobs WHERE state='pending' ORDER BY id").map_err(err)?;
+        let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper,color_mode,file FROM jobs WHERE state='pending' ORDER BY id").map_err(err)?;
         let mut selected = None;
         for row in stmt
-            .query_map([], |r| Ok((job_row(r)?, r.get::<_, String>(10)?)))
+            .query_map([], |r| Ok((job_row(r)?, r.get::<_, String>(11)?)))
             .map_err(err)?
         {
             let (job, file) = row.map_err(err)?;
@@ -610,7 +943,8 @@ impl Bridge {
                 .find(|p| p.id == job.printer_id && p.enabled)
             {
                 if p.queue != job.queue
-                    || Self::validate_options(p, job.copies, &job.sides, job.paper).is_err()
+                    || Self::validate_options(p, job.copies, &job.sides, job.paper, &job.color_mode)
+                        .is_err()
                 {
                     db.execute("UPDATE jobs SET state='failed',detail='目标或能力配置已变更',updated_at=? WHERE id=?",params![now(),job.id]).map_err(err)?;
                     continue;
@@ -645,6 +979,7 @@ impl Bridge {
                     copies: job.copies,
                     duplex: job.sides,
                     paper: job.paper,
+                    color_mode: job.color_mode,
                 },
             )
         };
@@ -676,7 +1011,12 @@ impl Bridge {
     }
     fn cleanup(&self) -> Result<()> {
         let db = self.db.lock().unwrap();
-        let mut stmt=db.prepare("SELECT file FROM jobs WHERE state IN ('submitted','simulated','failed','canceled') AND updated_at < ?").map_err(err)?;
+        db.execute(
+            "UPDATE jobs SET state='failed',detail='等待文档超时',updated_at=? WHERE state IN ('pending-document','pending-final-document') AND updated_at < ?",
+            params![now(), now() - IPP_DOCUMENT_TIMEOUT_SECS],
+        )
+        .map_err(err)?;
+        let mut stmt=db.prepare("SELECT file FROM jobs WHERE file<>'' AND state IN ('submitted','simulated','failed','canceled','completed') AND updated_at < ?").map_err(err)?;
         for row in stmt
             .query_map([now() - 86400], |r| r.get::<_, String>(0))
             .map_err(err)?
@@ -704,6 +1044,7 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
             let value: String = r.get(9)?;
             PaperSize::parse(&value).ok_or(rusqlite::Error::InvalidQuery)?
         },
+        color_mode: r.get(10)?,
     })
 }
 fn validate_pdf(bytes: &[u8]) -> Result<()> {
@@ -788,6 +1129,7 @@ pub(crate) mod tests {
             assert_eq!(printer.paper_sizes, vec![PaperSize::A4]);
             assert_eq!(printer.default_paper, PaperSize::A4);
             assert_eq!(bridge.job(1).unwrap().paper, PaperSize::A4);
+            assert_eq!(bridge.job(1).unwrap().color_mode, "auto");
             assert_eq!(bridge.job(1).unwrap().state, "submitted");
         }
     }
@@ -851,6 +1193,40 @@ pub(crate) mod tests {
         assert_eq!(bridge.job(job.id).unwrap().state, "failed");
     }
 
+    #[test]
+    fn print_color_mode_survives_database_reopen_for_print_and_create_job() {
+        let (directory, bridge, device) = fixture();
+        let printed = bridge
+            .accept_format(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                "color",
+                "application/pdf",
+                &pdf_bytes(),
+            )
+            .unwrap();
+        let created = bridge
+            .create_ipp_job(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                "monochrome",
+            )
+            .unwrap();
+        assert_eq!(printed.color_mode, "color");
+        assert_eq!(created.color_mode, "monochrome");
+        drop(bridge);
+
+        let reopened = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+        assert_eq!(reopened.job(printed.id).unwrap().color_mode, "color");
+        assert_eq!(reopened.job(created.id).unwrap().color_mode, "monochrome");
+    }
+
     fn submit(bridge: &Bridge, device: &CreatedDevice) -> Job {
         bridge
             .accept(
@@ -862,6 +1238,156 @@ pub(crate) mod tests {
                 &pdf_bytes(),
             )
             .unwrap()
+    }
+
+    fn create_waiting_document(bridge: &Bridge, device: &CreatedDevice) -> Job {
+        bridge
+            .create_ipp_job(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                "auto",
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn create_job_waits_until_the_last_document_is_received() {
+        let (_directory, bridge, device) = fixture();
+        let job = create_waiting_document(&bridge, &device);
+        assert_eq!(job.state, "pending-document");
+        assert!(!bridge.process_next().unwrap());
+
+        let staged = bridge
+            .send_ipp_document(
+                &device.device.id,
+                job.id,
+                &pdf_bytes(),
+                "application/pdf",
+                false,
+            )
+            .unwrap();
+        assert_eq!(staged.state, "pending-final-document");
+        assert!(!bridge.process_next().unwrap());
+
+        let ready = bridge
+            .send_ipp_document(&device.device.id, job.id, &[], "application/pdf", true)
+            .unwrap();
+        assert_eq!(ready.state, "pending");
+        assert!(bridge.process_next().unwrap());
+        assert_eq!(bridge.job(job.id).unwrap().state, "simulated");
+    }
+
+    #[test]
+    fn pending_document_can_be_canceled_and_empty_job_is_completed_without_printing() {
+        let (_directory, bridge, device) = fixture();
+        let canceled = create_waiting_document(&bridge, &device);
+        bridge.cancel_job(canceled.id).unwrap();
+        assert!(bridge
+            .send_ipp_document(
+                &device.device.id,
+                canceled.id,
+                &pdf_bytes(),
+                "application/pdf",
+                true,
+            )
+            .is_err());
+        assert_eq!(bridge.job(canceled.id).unwrap().state, "canceled");
+
+        let empty = create_waiting_document(&bridge, &device);
+        let completed = bridge
+            .send_ipp_document(&device.device.id, empty.id, &[], "application/pdf", true)
+            .unwrap();
+        assert_eq!(completed.state, "completed");
+        assert!(!bridge.process_next().unwrap());
+        let file: String = bridge
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT file FROM jobs WHERE id=?", [empty.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(file.is_empty());
+        assert_eq!(
+            bridge
+                .device_jobs(&device.device.id, "office", "completed", 20)
+                .unwrap()[0]
+                .id,
+            empty.id
+        );
+    }
+
+    #[test]
+    fn send_document_rechecks_service_device_printer_and_wait_timeout() {
+        let (_directory, bridge, device) = fixture();
+        let revoked = create_waiting_document(&bridge, &device);
+        bridge.revoke_device(&device.device.id).unwrap();
+        assert!(bridge
+            .send_ipp_document(
+                &device.device.id,
+                revoked.id,
+                &pdf_bytes(),
+                "application/pdf",
+                true,
+            )
+            .is_err());
+        assert_eq!(bridge.job(revoked.id).unwrap().state, "pending-document");
+
+        let device = bridge.create_device("Replacement Mac".into()).unwrap();
+        let stopped = create_waiting_document(&bridge, &device);
+        bridge.stop().unwrap();
+        assert!(bridge
+            .send_ipp_document(
+                &device.device.id,
+                stopped.id,
+                &pdf_bytes(),
+                "application/pdf",
+                true,
+            )
+            .is_err());
+        assert_eq!(bridge.job(stopped.id).unwrap().state, "pending-document");
+        bridge.running.store(true, Ordering::SeqCst);
+
+        let disabled = create_waiting_document(&bridge, &device);
+        let mut printer = bridge.printer("office").unwrap();
+        printer.enabled = false;
+        bridge.save_printer(printer.clone()).unwrap();
+        assert!(bridge
+            .send_ipp_document(
+                &device.device.id,
+                disabled.id,
+                &pdf_bytes(),
+                "application/pdf",
+                true,
+            )
+            .is_err());
+        assert_eq!(bridge.job(disabled.id).unwrap().state, "pending-document");
+        printer.enabled = true;
+        bridge.save_printer(printer).unwrap();
+
+        let timed_out = create_waiting_document(&bridge, &device);
+        bridge
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET updated_at=? WHERE id=?",
+                params![now() - IPP_DOCUMENT_TIMEOUT_SECS - 1, timed_out.id],
+            )
+            .unwrap();
+        assert!(bridge
+            .send_ipp_document(
+                &device.device.id,
+                timed_out.id,
+                &[],
+                "application/pdf",
+                true
+            )
+            .is_err());
+        assert_eq!(bridge.job(timed_out.id).unwrap().state, "failed");
     }
 
     fn document_path(bridge: &Bridge, id: i64) -> PathBuf {

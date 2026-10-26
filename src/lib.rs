@@ -1,3 +1,5 @@
+mod discovery;
+pub mod document;
 pub mod download;
 pub mod ipp;
 pub mod media;

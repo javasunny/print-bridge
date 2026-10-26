@@ -16,9 +16,11 @@ cargo run --manifest-path desktop/Cargo.toml --locked
 
 每台共享打印机可配置已验证的纸张（A3、A4、A5、A6、Letter、Legal、Tabloid）、默认纸张、最大份数和双面能力。至少选择一种纸张，默认纸张必须在所选范围内。请只启用 Windows 驱动和真实打印机支持的尺寸与双面能力；未启用的选项会被拒绝。旧配置和历史任务沿用 A4。
 
-启动服务后，每台共享打印机显示并提供复制按钮：Address、Protocol、Queue、PPD 下载地址。macOS 添加时，在“打印机与扫描仪 → 添加打印机 → IP”填写：Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。在 Mac 浏览器打开该队列的 PPD 下载地址（`http://Windows地址:端口/ipp/printers/桥接ID/driver.ppd`），保存 PPD。Use 选择 Other，打开下载的文件，确认显示 `Print Bridge PDF` 后添加。PPD 仅包含该队列已配置的纸张；开启双面后提供长边、短边双面，默认仍为单面。驱动名称不包含纸张或单双面模式，不含地址或凭据；PPD 下载与 IPP 能力查询一样无需认证。认证开启时，打印任务仍使用设备 ID 和令牌。
+启动服务后，共享队列通过 Bonjour 发布；在私有网络放行服务 TCP 端口及 UDP 5353。Mac 在“打印机与扫描仪 → 添加”的默认列表选择共享名称，Use 选择 AirPrint，无需下载 PPD。iPhone/iPad 在应用的“打印 → 选择打印机”中选择同名队列。认证开启时仍使用设备 ID 和令牌；首次免认证联机测试可手动关闭认证并重启服务。实验性能力和联机验收说明见 [AirPrint 说明](../docs/airprint.md)。
 
-修改纸张、默认纸张、份数上限或双面能力后，重新下载 PPD 并在 Mac 队列重新选择，或重新添加队列；macOS 会保留安装时的配置。Name 是可自行修改的打印机名称。仓库中的 [Print-Bridge-PDF.ppd](../macos/Print-Bridge-PDF.ppd) 仅作为 A4 单面备用配置，多纸张和双面请使用每台打印机的下载地址。PDF 按所选目标纸张适应可打印区域缩放；Windows 端使用标准纸张编号（paperkind），避免中文或驱动自定义纸张名称影响匹配。
+每台共享打印机仍显示并提供复制按钮：Address、Protocol、Queue、PPD 下载地址，作为手动连接备用。Mac 手动添加时，Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。旧 PDF PPD 仍可从该队列的下载地址（`http://Windows地址:端口/ipp/printers/桥接ID/driver.ppd`）保存，再在 Use → Other 中选择。PPD 仅包含该队列已配置的纸张和双面；下载与 IPP 能力查询一样无需认证。
+
+修改纸张、默认纸张、份数上限或双面能力后，广播会更新；Mac 可能需要重新添加队列。旧 PPD 队列需重新下载并选择 PPD，macOS 会保留安装时的配置。Name 是可自行修改的打印机名称。仓库中的 [Print-Bridge-PDF.ppd](../macos/Print-Bridge-PDF.ppd) 仅作为 A4 单面备用配置，多纸张和双面请使用每台打印机的下载地址。PDF 按所选目标纸张适应可打印区域缩放；Windows 端使用标准纸张编号（paperkind），避免中文或驱动自定义纸张名称影响匹配。
 
 关闭窗口隐藏到系统托盘；在托盘选择“打开 Print Bridge”可恢复窗口。“停止服务并退出”先停止接收和领取任务，若仍有打印调用则拒绝退出并提示稍后重试，不强行终止打印。
 

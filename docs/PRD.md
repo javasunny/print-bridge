@@ -8,6 +8,8 @@
 >
 > 2026-10-26 修订：按用户要求增加可关闭的设备认证，用于先验证打印流程。默认仍开启认证；关闭期间局域网客户端可直接打印，匿名任务共用身份。
 
+> 2026-10-26 无驱动接入扩展：用户授权实现 Bonjour 自动发现、AirPrint/IPP Everywhere 所需的单文档 Create-Job/Send-Document 和 JPEG/URF/PWG Raster 转 PDF，并传递原生客户端的彩色/黑白选项。本文原首版限制由本次修订及 [AirPrint 说明](airprint.md) 覆盖；认证不自动关闭，仍需 Apple 设备与 Windows 联机验收。
+
 ## 1. 项目目标
 
 开发一个运行在 Windows 上的多打印机桥接客户端。
@@ -24,7 +26,7 @@
 | Windows 打印机 | 枚举已安装打印机，允许共享多台 |
 | macOS 接入 | 每台共享打印机提供独立 IPP 地址 |
 | 打印入口 | 仅 IPP，不提供网页上传 |
-| 文档格式 | 首版仅接受 PDF |
+| 文档格式 | PDF、JPEG、300 dpi 灰度/sRGB URF 与 PWG Raster，内部统一为 PDF |
 | 打印选项 | 按队列配置 A3/A4/A5/A6/Letter/Legal/Tabloid、默认纸张、份数、单面、长边双面、短边双面 |
 | 打印执行 | 设置中手动下载并校验 SumatraPDF，调用目标 Windows 驱动 |
 | 访问控制 | 设备令牌鉴权 |
@@ -37,8 +39,6 @@
 
 - 网页打印、文件上传 API、远程管理页面。
 - macOS 原生客户端。
-- Bonjour/mDNS 自动发现。
-- 非 PDF 格式的转换。
 - 云服务、公网打印。
 - 驱动自动安装。
 - 彩色、其他纸张、纸盒及装订等扩展选项。
@@ -158,12 +158,13 @@ ipp://<Windows地址>:<端口>/ipp/printers/warehouse
 |---|---|
 | Get-Printer-Attributes | 查询打印机能力及状态 |
 | Validate-Job | 校验格式和打印选项 |
-| Print-Job | 提交单个 PDF 打印任务 |
+| Print-Job | 提交单个支持格式的打印文档 |
+| Create-Job / Send-Document | 创建等待任务，上传单个文档并结束后排队 |
 | Get-Job-Attributes | 查询任务状态 |
 | Get-Jobs | 查询当前设备的任务 |
 | Cancel-Job | 取消尚未执行的任务 |
 
-首版不支持多文档任务、Create-Job/Send-Document，以及 PostScript、PWG Raster 等非 PDF 输入。
+不支持多文档任务、PostScript 或未声明的栅格编码。JPEG/URF/PWG Raster 转换为 PDF 后沿用后端校验和调度。
 
 ### 6.2 请求处理
 
@@ -359,7 +360,7 @@ PDF → SumatraPDF 渲染 → Windows 驱动 → 打印机
 2. 系统打印界面能够输入和保存设备凭据，撤销后旧凭据无法继续提交。
 3. 固定版本的 SumatraPDF 能向指定队列打印，并正确应用份数、A4 和两种双面方向。
 
-记录 Windows/macOS 版本与架构、驱动版本、SumatraPDF 版本、添加方式及协议抓取结论；抓取材料须去除认证头和文档内容。若系统必须使用 Create-Job/Send-Document 或非 PDF 格式，应先记录为兼容性阻断项，重新确认范围，不直接扩展协议或格式支持。
+记录 Windows/macOS 版本与架构、驱动版本、SumatraPDF 版本、添加方式及协议抓取结论；抓取材料须去除认证头和文档内容。本次已授权扩展 Create-Job/Send-Document 与声明的 JPEG/URF/PWG Raster 格式；其他格式仍作为兼容性阻断项记录。
 
 建议首版先以 Windows 11 x64 为发布目标；具体最低 Windows 版本、macOS 版本和 ARM64 支持范围在此关卡定稿。开发机上可运行通用逻辑，不代表可发布 macOS 桥接服务。
 

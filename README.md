@@ -1,13 +1,13 @@
 # Print Bridge
 
-Windows 多打印机 IPP 桥接 MVP，使用 Tauri 和 Rust。macOS 通过各打印机独立的 IPP 地址提交 PDF，Windows 端使用 SumatraPDF 调用指定打印队列。首次使用时在设置中手动下载打印组件。
+Windows 多打印机 IPP 桥接工具，使用 Tauri 和 Rust。Mac、iPhone 和 iPad 可通过实验性 AirPrint 自动发现共享队列，提交的 PDF、JPEG、URF 或 PWG Raster 统一为 PDF 后，由 Windows 端使用 SumatraPDF 调用指定打印队列。首次使用时在设置中手动下载打印组件。
 
 当前为开发版本，已在 macOS 上交叉构建 Windows x64 EXE 和 NSIS 安装包。用户已验证 macOS 通过 Windows 首次真实打印成功；设备认证和多队列等场景仍需继续实机验收。
 
 ## 已实现
 
 - 本地桌面管理：共享打印机、手动能力配置、设备凭据、任务列表、服务启停及托盘。
-- IPP 1.1/2.0 六项操作；打印机能力可匿名查询，默认使用 HTTP Basic 设备令牌认证。可在设置中关闭认证，先测试免认证打印流程。
+- IPP 1.1/2.0，支持 Print-Job 和 Create-Job/Send-Document 单文档流程；打印机能力可匿名查询，默认使用 HTTP Basic 设备令牌认证。可在设置中关闭认证，先测试免认证打印流程。
 - PDF 结构、加密、页数及大小检查；A3、A4、A5、A6、Letter、Legal、Tabloid，1–99 份及能力允许的单面、长边双面、短边双面。
 - SQLite 与 PDF 持久化、全局串行调度、等待任务取消；重启后处理中任务进入待核查。
 - 打印目标固定，不回退到默认打印机；超时或非零退出不会自动重打。
@@ -16,11 +16,13 @@ Windows 多打印机 IPP 桥接 MVP，使用 Tauri 和 Rust。macOS 通过各打
 - 每台打印机独立配置已验证的纸张、默认纸张和双面能力，并提供匹配配置的 macOS PPD 下载地址。旧配置与历史任务保持 A4 默认值。
 - 连接诊断：显示来源 IP、请求时间、IPP 操作和处理结果，包含尚未进入任务列表的查询与拒绝请求。
 
+- Bonjour 自动发现每个共享队列，声明纸张、双面、300 dpi 灰度/sRGB 栅格能力；Mac 无需手动 PPD。详情与验收边界见 [AirPrint 说明](docs/airprint.md)。
+
 ## 运行
 
 用户直接安装 Windows 安装包。启动后打开“设置 → 下载打印组件”，下载完成后配置共享打印机和设备凭据。
 
-本机构建产物位于 `dist`：推荐安装 `Print Bridge_0.1.5_x64-setup.exe`，安装程序按需下载 WebView2；独立应用 `Print-Bridge-Windows-x64.exe` 要求系统已有 WebView2。两个文件均未签名。
+本机构建产物位于 `dist`：推荐安装 `Print Bridge_0.1.6_x64-setup.exe`，安装程序按需下载 WebView2；独立应用 `Print-Bridge-Windows-x64.exe` 要求系统已有 WebView2。两个文件均未签名。
 
 从源码运行时，Windows 开发环境需要 Rust MSVC 工具链、Visual Studio C++ 构建工具和 WebView2：
 
@@ -61,13 +63,13 @@ Rust 测试包括监听 `127.0.0.1` 随机端口的分块 HTTP/IPP 模拟测试�
 
 ## 当前边界
 
-- 用户已通过 macOS 原生队列验证首次免认证 PDF 打印；Basic 凭据保存和更多驱动场景仍待联机验证，不宣称完整 AirPrint 或 IPP Everywhere 兼容。
-- 不支持 Create-Job/Send-Document、多文档或非 PDF 输入；未支持的打印选项会被拒绝。
+- 用户已通过旧版本 macOS 原生队列验证首次免认证 PDF 打印；新增无驱动接入、Basic 凭据保存和 iPhone/iPad 实际出纸仍需联机验证，不宣称已经取得 AirPrint 或 IPP Everywhere 认证。
+- 不支持多文档任务；栅格只接受所声明的格式及分辨率，未支持的编码或打印选项会被拒绝。
 - 暂无可靠的跨连接幂等标识，因此主动重复提交会创建独立任务，网络重试也可能重复。应用自身不会自动重试打印调用。
 - 待核查任务保留文件并提示人工检查；当前没有人工归档操作。界面显示最近 1000 条任务。
 - PDF 检查已有输入大小和页数上限，但还没有独立进程的解析超时与内存隔离。不要向开发版本提交不可信 PDF。
-- 暂无 IPPS、自动发现、登录启动、自动升级或签名安装包。多打印机先全局串行执行。
-- 能力由本地手动配置，应先在 Windows 驱动中验证。界面不提供彩色选择，颜色沿用驱动默认值。
+- 暂无 IPPS、登录启动、自动升级或签名安装包。多打印机先全局串行执行；自动发现需要私有网络放行 UDP 5353。
+- 能力由本地手动配置，应先在 Windows 驱动中验证。桌面界面不另设颜色控件；客户端显式彩色/黑白选项会传给 Windows 驱动，auto 沿用驱动默认值。
 
 终态 PDF 保留 24 小时；等待、处理中和待核查的文件不自动删除。数据放在 Tauri 用户应用数据目录的 `production` 或 `simulation` 子目录。
 

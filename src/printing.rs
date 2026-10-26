@@ -19,6 +19,12 @@ pub struct PrintOptions {
     pub duplex: String,
     #[serde(default)]
     pub paper: PaperSize,
+    #[serde(default = "default_color_mode")]
+    pub color_mode: String,
+}
+
+fn default_color_mode() -> String {
+    "auto".into()
 }
 
 impl Default for PrintOptions {
@@ -27,6 +33,7 @@ impl Default for PrintOptions {
             copies: 1,
             duplex: "one-sided".into(),
             paper: PaperSize::A4,
+            color_mode: default_color_mode(),
         }
     }
 }
@@ -58,12 +65,18 @@ pub fn build_print_args(
         "two-sided-short-edge" => "duplexshort",
         _ => return Err("不支持的单双面选项".into()),
     };
+    let color = match options.color_mode.as_str() {
+        "auto" => "",
+        "color" => ",color",
+        "monochrome" => ",monochrome",
+        _ => return Err("不支持的颜色模式".into()),
+    };
     Ok(vec![
         "-print-to".into(),
         queue.into(),
         "-print-settings".into(),
         format!(
-            "paperkind={},fit,{}x,{sides}",
+            "paperkind={},fit,{}x,{sides}{color}",
             options.paper.windows_paper_kind(),
             options.copies
         )
@@ -227,6 +240,7 @@ mod tests {
                         copies: 3,
                         duplex: input.into(),
                         paper,
+                        ..Default::default()
                     },
                 )
                 .unwrap();
@@ -262,6 +276,7 @@ mod tests {
                 copies: 1,
                 duplex: "simplex,2x".into(),
                 paper: PaperSize::A4,
+                ..Default::default()
             }
         )
         .is_err());
@@ -272,6 +287,30 @@ mod tests {
             &PrintOptions::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn explicit_color_modes_reach_the_driver_and_cannot_inject_print_settings() {
+        for mode in ["color", "monochrome"] {
+            let options = PrintOptions {
+                color_mode: mode.into(),
+                ..Default::default()
+            };
+            let args = build_print_args("Exact Queue", &pdf(), &options).unwrap();
+            assert_eq!(
+                args[3],
+                OsString::from(format!("paperkind=9,fit,1x,simplex,{mode}"))
+            );
+            assert_eq!(args[1], "Exact Queue");
+        }
+        let invalid = PrintOptions {
+            color_mode: "color,100x".into(),
+            ..Default::default()
+        };
+        assert!(build_print_args("Exact Queue", &pdf(), &invalid).is_err());
+        let legacy: PrintOptions =
+            serde_json::from_str(r#"{"copies":1,"duplex":"one-sided","paper":"A4"}"#).unwrap();
+        assert_eq!(legacy.color_mode, "auto");
     }
 
     #[test]

@@ -40,7 +40,7 @@ fn body_error_response(error: axum::Error) -> Response {
     let (status, detail) = if too_large {
         (
             StatusCode::PAYLOAD_TOO_LARGE,
-            "请求超过大小上限（PDF 最多 100 MiB）",
+            "请求超过大小上限（文档最多 100 MiB）",
         )
     } else {
         (
@@ -238,7 +238,9 @@ async fn handle(State(server): State<Server>, request: Request) -> Response {
                     match operation {
                         Some(GET_PRINTER_ATTRIBUTES) => "打印机能力查询成功（尚未提交打印任务）",
                         Some(VALIDATE_JOB) => "打印参数验证通过（尚未提交文档）",
-                        Some(PRINT_JOB) => "PDF 打印任务已接收",
+                        Some(PRINT_JOB) => "打印任务已接收",
+                        Some(CREATE_JOB) => "已创建等待文档的任务",
+                        Some(SEND_DOCUMENT) => "文档已接收",
                         Some(GET_JOB_ATTRIBUTES | GET_JOBS) => "任务状态查询成功",
                         Some(CANCEL_JOB) => "取消请求已处理",
                         _ => "IPP 请求已响应",
@@ -296,6 +298,186 @@ fn media_collection(bytes: &mut Vec<u8>, name: &str, paper: PaperSize) {
     }
     collection_field(bytes, END_COLLECTION, "", &[]);
     collection_field(bytes, END_COLLECTION, "", &[]);
+}
+
+#[derive(Debug)]
+enum CollectionValue {
+    Value(u8, Vec<u8>),
+    Collection(Vec<(String, CollectionValue)>),
+}
+
+fn collection_length(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
+    let end = (*cursor).checked_add(2)?;
+    let value = bytes.get(*cursor..end)?;
+    *cursor = end;
+    Some(u16::from_be_bytes([value[0], value[1]]) as usize)
+}
+
+fn collection_take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize) -> Option<&'a [u8]> {
+    let end = (*cursor).checked_add(length)?;
+    let value = bytes.get(*cursor..end)?;
+    *cursor = end;
+    Some(value)
+}
+
+fn collection_entries(bytes: &[u8], cursor: &mut usize) -> Option<Vec<(String, CollectionValue)>> {
+    let mut entries = Vec::new();
+    loop {
+        let tag = *collection_take(bytes, cursor, 1)?.first()?;
+        let name_length = collection_length(bytes, cursor)?;
+        let name = collection_take(bytes, cursor, name_length)?;
+        let value_length = collection_length(bytes, cursor)?;
+        let value = collection_take(bytes, cursor, value_length)?;
+        if tag == END_COLLECTION {
+            if !name.is_empty() || !value.is_empty() {
+                return None;
+            }
+            return Some(entries);
+        }
+        if tag != MEMBER_ATTR_NAME || !name.is_empty() {
+            return None;
+        }
+        let member = std::str::from_utf8(value).ok()?.to_owned();
+        if member.is_empty() {
+            return None;
+        }
+        let tag = *collection_take(bytes, cursor, 1)?.first()?;
+        if collection_length(bytes, cursor)? != 0 {
+            return None;
+        }
+        let value_length = collection_length(bytes, cursor)?;
+        let value = collection_take(bytes, cursor, value_length)?;
+        let value = if tag == BEGIN_COLLECTION {
+            if !value.is_empty() {
+                return None;
+            }
+            CollectionValue::Collection(collection_entries(bytes, cursor)?)
+        } else {
+            CollectionValue::Value(tag, value.to_vec())
+        };
+        if entries.iter().any(|(name, _)| name == &member) {
+            return None;
+        }
+        entries.push((member, value));
+    }
+}
+
+fn media_col_paper(attribute: &Attribute) -> Result<PaperSize, String> {
+    if attribute.tag != BEGIN_COLLECTION {
+        return Err("media-col must be a collection".into());
+    }
+    let mut cursor = 0;
+    let entries = collection_entries(&attribute.value, &mut cursor)
+        .filter(|_| cursor == attribute.value.len())
+        .ok_or_else(|| "Invalid media-col collection".to_string())?;
+    let mut named = None;
+    let mut dimensions = None;
+    for (name, value) in entries {
+        match (name.as_str(), value) {
+            ("media-size-name", CollectionValue::Value(KEYWORD | NAME, bytes)) => {
+                let value = std::str::from_utf8(&bytes)
+                    .ok()
+                    .and_then(PaperSize::parse)
+                    .ok_or_else(|| "Unsupported media-size-name".to_string())?;
+                named = Some(value);
+            }
+            ("media-size", CollectionValue::Collection(fields)) => {
+                let mut width = None;
+                let mut height = None;
+                if fields
+                    .iter()
+                    .any(|(name, value)| match (name.as_str(), value) {
+                        ("x-dimension", CollectionValue::Value(INTEGER, bytes))
+                            if bytes.len() == 4 =>
+                        {
+                            width = Some(i32::from_be_bytes(bytes.as_slice().try_into().unwrap()));
+                            false
+                        }
+                        ("y-dimension", CollectionValue::Value(INTEGER, bytes))
+                            if bytes.len() == 4 =>
+                        {
+                            height = Some(i32::from_be_bytes(bytes.as_slice().try_into().unwrap()));
+                            false
+                        }
+                        _ => true,
+                    })
+                {
+                    return Err("Unsupported media-size member".into());
+                }
+                let (width, height) = (width, height);
+                let size = crate::media::PAPER_SIZES
+                    .into_iter()
+                    .find(|paper| Some(paper.dimensions()) == width.zip(height))
+                    .ok_or_else(|| "Unsupported media-size dimensions".to_string())?;
+                dimensions = Some(size);
+            }
+            (
+                "media-bottom-margin"
+                | "media-left-margin"
+                | "media-right-margin"
+                | "media-top-margin",
+                CollectionValue::Value(INTEGER, bytes),
+            ) if bytes.as_slice() == 0i32.to_be_bytes().as_slice() => {}
+            _ => return Err(format!("Unsupported media-col member: {name}")),
+        }
+    }
+    match (named, dimensions) {
+        (Some(name), Some(size)) if name != size => Err("Conflicting media-size members".into()),
+        (Some(name), _) => Ok(name),
+        (_, Some(size)) => Ok(size),
+        _ => Err("media-col is missing media-size".into()),
+    }
+}
+
+fn resolution_300_dpi(attribute: &Attribute) -> bool {
+    let mut expected = Vec::with_capacity(9);
+    expected.extend_from_slice(&300i32.to_be_bytes());
+    expected.extend_from_slice(&300i32.to_be_bytes());
+    expected.push(3);
+    attribute.tag == RESOLUTION && attribute.value == expected
+}
+
+fn resolution_attribute(name: &str) -> Attribute {
+    let mut value = Vec::with_capacity(9);
+    value.extend_from_slice(&300i32.to_be_bytes());
+    value.extend_from_slice(&300i32.to_be_bytes());
+    value.push(3);
+    Attribute {
+        tag: RESOLUTION,
+        name: name.into(),
+        value,
+    }
+}
+
+fn document_mime<'a>(message: &'a Message<'_>) -> &'a str {
+    let mut attributes = message.attributes("document-format");
+    let Some(first) = attributes.next() else {
+        return "application/pdf";
+    };
+    if first
+        .as_str()
+        .is_some_and(|value| value.eq_ignore_ascii_case("application/octet-stream"))
+    {
+        return attributes
+            .find_map(|attribute| {
+                attribute
+                    .as_str()
+                    .filter(|value| !value.eq_ignore_ascii_case("application/octet-stream"))
+            })
+            .unwrap_or("application/octet-stream");
+    }
+    first.as_str().unwrap_or("application/pdf")
+}
+
+fn supported_document_mime(mime: &str) -> bool {
+    [
+        "application/pdf",
+        "image/jpeg",
+        "image/urf",
+        "image/pwg-raster",
+    ]
+    .iter()
+    .any(|supported| mime.eq_ignore_ascii_case(supported))
 }
 
 fn printer_reply(
@@ -366,6 +548,12 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
         "sides",
         "media",
         "document-format",
+        "media-col",
+        "printer-resolution",
+        "print-color-mode",
+        "ColorModel",
+        "print-quality",
+        "last-document",
     ] {
         let attributes: Vec<_> = message.attributes(name).collect();
         // macOS appends an octet-stream fallback; accept only this PDF pair and still validate the document.
@@ -407,6 +595,11 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
             return fail(CLIENT_ERROR_BAD_REQUEST, "Invalid integer attribute");
         }
     }
+    if message.attribute("last-document").is_some_and(|attribute| {
+        attribute.tag != BOOLEAN || attribute.value.len() != 1 || attribute.value[0] > 1
+    }) {
+        return fail(CLIENT_ERROR_BAD_REQUEST, "Invalid last-document attribute");
+    }
     let parts: Vec<_> = path.split('/').collect();
     let Some(printer_id) = parts.get(3) else {
         return fail(CLIENT_ERROR_NOT_FOUND, "Unknown printer");
@@ -424,33 +617,62 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
     } else if text(&message, "job-uri").is_none() {
         return fail(CLIENT_ERROR_BAD_REQUEST, "Missing target URI");
     }
-    if message.code != PRINT_JOB && !message.document.is_empty() {
+    if !matches!(message.code, PRINT_JOB | SEND_DOCUMENT) && !message.document.is_empty() {
         return fail(CLIENT_ERROR_BAD_REQUEST, "Unexpected document");
     }
     match message.code {
         GET_PRINTER_ATTRIBUTES => {
             printer_reply(&message, &printer, &uri, bridge.authentication_required())
         }
-        VALIDATE_JOB | PRINT_JOB => {
+        VALIDATE_JOB | PRINT_JOB | CREATE_JOB => {
             if parts.len() != 4 {
                 return fail(CLIENT_ERROR_BAD_REQUEST, "Expected printer route");
             }
             if !printer.enabled {
                 return fail(SERVER_ERROR_SERVICE_UNAVAILABLE, "Printer disabled");
             }
-            let (copies, sides, paper) = match options(&message, &printer) {
+            let (copies, sides, paper, color_mode) = match options(&message, &printer) {
                 Ok(o) => o,
                 Err((code, s)) => return fail(code, &s),
             };
             if message.code == VALIDATE_JOB {
                 return reply(&message, SUCCESSFUL_OK, vec![], "");
             }
-            match bridge.accept(device, &printer.id, copies, sides, paper, message.document) {
+            if message.code == CREATE_JOB {
+                return match bridge.create_ipp_job(
+                    device,
+                    &printer.id,
+                    copies,
+                    sides,
+                    paper,
+                    &color_mode,
+                ) {
+                    Ok(job) => reply(&message, SUCCESSFUL_OK, vec![job_group(&job, &uri)], ""),
+                    Err(error) => fail(CLIENT_ERROR_NOT_POSSIBLE, &error),
+                };
+            }
+            match bridge.accept_format(
+                device,
+                &printer.id,
+                copies,
+                sides,
+                paper,
+                &color_mode,
+                document_mime(&message),
+                message.document,
+            ) {
                 Ok(job) => reply(&message, SUCCESSFUL_OK, vec![job_group(&job, &uri)], ""),
-                Err(error) => fail(CLIENT_ERROR_NOT_POSSIBLE, &error),
+                Err(error) => fail(
+                    if error.contains("文档格式错误") {
+                        CLIENT_ERROR_DOCUMENT_FORMAT_ERROR
+                    } else {
+                        CLIENT_ERROR_NOT_POSSIBLE
+                    },
+                    &error,
+                ),
             }
         }
-        GET_JOB_ATTRIBUTES | CANCEL_JOB => {
+        SEND_DOCUMENT | GET_JOB_ATTRIBUTES | CANCEL_JOB => {
             let attr_id = message
                 .attribute("job-id")
                 .and_then(|a| a.as_i32())
@@ -481,6 +703,54 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
                         CLIENT_ERROR_NOT_POSSIBLE,
                         "Only pending jobs can be canceled",
                     ),
+                };
+            }
+            if message.code == SEND_DOCUMENT {
+                if parts.len() != 4 && parts.len() != 6 {
+                    return fail(CLIENT_ERROR_BAD_REQUEST, "Expected job route");
+                }
+                let last_document = message
+                    .attribute("last-document")
+                    .map(|attribute| attribute.value.as_slice() == [1])
+                    .unwrap_or(false);
+                if message.attribute("last-document").is_none() {
+                    return fail(CLIENT_ERROR_BAD_REQUEST, "Missing last-document");
+                }
+                if !supported_document_mime(document_mime(&message)) {
+                    return fail(
+                        CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED,
+                        "Unsupported document-format",
+                    );
+                }
+                if text(&message, "compression").is_some_and(|value| value != "none") {
+                    return fail(
+                        CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+                        "Compression not supported",
+                    );
+                }
+                if !printer.enabled {
+                    return fail(SERVER_ERROR_SERVICE_UNAVAILABLE, "Printer disabled");
+                }
+                return match bridge.send_ipp_document(
+                    device,
+                    id,
+                    message.document,
+                    document_mime(&message),
+                    last_document,
+                ) {
+                    Ok(job) => reply(&message, SUCCESSFUL_OK, vec![job_group(&job, &uri)], ""),
+                    Err(error) => {
+                        let status = if error.contains("不支持一个任务包含多个文档") {
+                            SERVER_ERROR_MULTIPLE_DOCUMENT_JOBS_NOT_SUPPORTED
+                        } else if error.contains("文档格式错误") {
+                            CLIENT_ERROR_DOCUMENT_FORMAT_ERROR
+                        } else if error == "任务不存在" {
+                            CLIENT_ERROR_NOT_FOUND
+                        } else {
+                            CLIENT_ERROR_NOT_POSSIBLE
+                        };
+                        fail(status, &error)
+                    }
                 };
             }
             reply(&message, SUCCESSFUL_OK, vec![job_group(&job, &uri)], "")
@@ -527,15 +797,19 @@ fn uri_path(uri: &str) -> Option<&str> {
 fn options<'a>(
     m: &'a Message<'_>,
     p: &SharedPrinter,
-) -> Result<(u32, &'a str, PaperSize), (u16, String)> {
+) -> Result<(u32, &'a str, PaperSize, String), (u16, String)> {
     for (name, tag) in [
         ("document-format", MIME_MEDIA_TYPE),
         ("sides", KEYWORD),
         ("media", KEYWORD),
+        ("media-col", BEGIN_COLLECTION),
+        ("printer-resolution", RESOLUTION),
+        ("print-color-mode", KEYWORD),
+        ("print-quality", ENUM),
     ] {
-        if m.attribute(name)
-            .is_some_and(|a| a.tag != tag || a.as_str().is_none())
-        {
+        if m.attribute(name).is_some_and(|attribute| {
+            attribute.tag != tag || tag != BEGIN_COLLECTION && attribute.as_str().is_none()
+        }) {
             return Err((
                 CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
                 "Invalid print attribute type".into(),
@@ -558,6 +832,10 @@ fn options<'a>(
                         "copies"
                             | "sides"
                             | "media"
+                            | "media-col"
+                            | "printer-resolution"
+                            | "print-color-mode"
+                            | "print-quality"
                             | "PageSize"
                             | "number-up"
                             | "finishings"
@@ -586,14 +864,10 @@ fn options<'a>(
             }
         }
     }
-    if m.attribute("document-format").is_some()
-        && !m
-            .attributes("document-format")
-            .any(|a| a.as_str() == Some("application/pdf"))
-    {
+    if !supported_document_mime(document_mime(m)) {
         return Err((
             CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED,
-            "Only application/pdf is supported".into(),
+            "Unsupported document-format".into(),
         ));
     }
     let copies = match m.attribute("copies") {
@@ -645,10 +919,18 @@ fn options<'a>(
     {
         return Err(unsupported("Unsupported or conflicting PageSize"));
     }
+    let media_col = m
+        .attribute("media-col")
+        .map(media_col_paper)
+        .transpose()
+        .map_err(|detail| unsupported(&detail))?;
+    if (media.is_some() || page_size.is_some()) && media_col.is_some_and(|value| value != paper) {
+        return Err(unsupported("Conflicting media-col and media"));
+    }
+    let paper = media_col.unwrap_or(paper);
     for (name, tag, value) in [
         ("AP_ColorMatchingMode", NAME, "AP_ApplicationColorMatching"),
         ("AP_D_InputSlot", NAME, ""),
-        ("ColorModel", NAME, "Gray"),
         ("pserrorhandler-requested", NAME, "standard"),
         ("job-hold-until", KEYWORD, "no-hold"),
     ] {
@@ -660,6 +942,18 @@ fn options<'a>(
                 format!("Unsupported value for {name}"),
             ));
         }
+    }
+    let native_color_mode = text(m, "ColorModel")
+        .map(|value| match value {
+            "Gray" => Ok("monochrome"),
+            "RGB" => Ok("color"),
+            _ => Err(unsupported("Unsupported value for ColorModel")),
+        })
+        .transpose()?;
+    if m.attributes("ColorModel").any(|attribute| {
+        attribute.tag != NAME || !matches!(attribute.as_str(), Some("Gray") | Some("RGB"))
+    }) {
+        return Err(unsupported("Unsupported value for ColorModel"));
     }
     for (name, unsupported) in [
         (
@@ -710,15 +1004,35 @@ fn options<'a>(
             "Unsupported page size, number-up or finishing".into(),
         ));
     }
-    for name in [
-        "page-ranges",
-        "orientation-requested",
-        "print-color-mode",
-        "media-col",
-        "printer-resolution",
-        "output-bin",
-        "print-quality",
-    ] {
+    if m.attributes("printer-resolution")
+        .any(|attribute| !resolution_300_dpi(attribute))
+    {
+        return Err(unsupported("Unsupported printer-resolution"));
+    }
+    if m.attributes("print-color-mode").any(|attribute| {
+        !matches!(
+            attribute.as_str(),
+            Some("auto") | Some("color") | Some("monochrome")
+        )
+    }) {
+        return Err(unsupported("Unsupported print-color-mode"));
+    }
+    let ipp_color_mode = text(m, "print-color-mode");
+    if ipp_color_mode.is_some()
+        && native_color_mode.is_some_and(|native| Some(native) != ipp_color_mode)
+    {
+        return Err(unsupported("Conflicting print-color-mode and ColorModel"));
+    }
+    let color_mode = ipp_color_mode
+        .or(native_color_mode)
+        .unwrap_or("auto")
+        .to_owned();
+    if m.attributes("print-quality")
+        .any(|attribute| attribute.as_i32() != Some(4))
+    {
+        return Err(unsupported("Unsupported print-quality"));
+    }
+    for name in ["page-ranges", "orientation-requested", "output-bin"] {
         if m.attribute(name).is_some() {
             return Err((
                 CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
@@ -726,17 +1040,19 @@ fn options<'a>(
             ));
         }
     }
-    Bridge::validate_options(p, copies, sides, paper).map_err(|error| {
+    Bridge::validate_options(p, copies, sides, paper, &color_mode).map_err(|error| {
         (
             CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
             format!("Unsupported copies, sides or media: {error}"),
         )
     })?;
-    Ok((copies, sides, paper))
+    Ok((copies, sides, paper, color_mode))
 }
 fn printer_group(p: &SharedPrinter, uri: &str, authentication_required: bool) -> Group {
+    let uuid = format!("urn:uuid:{}", crate::discovery::printer_uuid(&p.id));
     let mut a = vec![
         Attribute::text(URI, "printer-uri-supported", uri),
+        Attribute::text(URI, "printer-uuid", &uuid),
         Attribute::text(
             KEYWORD,
             "uri-authentication-supported",
@@ -785,8 +1101,52 @@ fn printer_group(p: &SharedPrinter, uri: &str, authentication_required: bool) ->
         Attribute::text(KEYWORD, "sides-default", "one-sided"),
         Attribute::integer(INTEGER, "copies-default", 1),
         Attribute::boolean("multiple-document-jobs-supported", false),
+        Attribute::integer(INTEGER, "multiple-operation-time-out", 120),
+        Attribute::text(KEYWORD, "print-color-mode-default", "auto"),
+        Attribute::text(KEYWORD, "print-color-mode-supported", "auto"),
+        Attribute::text(KEYWORD, "print-color-mode-supported", "color"),
+        Attribute::text(KEYWORD, "print-color-mode-supported", "monochrome"),
+        Attribute::boolean("color-supported", true),
+        Attribute::integer(ENUM, "print-quality-default", 4),
+        Attribute::integer(ENUM, "print-quality-supported", 4),
         Attribute::text(KEYWORD, "compression-supported", "none"),
+        Attribute::text(KEYWORD, "pwg-raster-document-type-supported", "sgray_8"),
+        Attribute::text(KEYWORD, "pwg-raster-document-type-supported", "srgb_8"),
     ];
+    let format_default = a
+        .iter()
+        .position(|attribute| attribute.name == "document-format-default")
+        .unwrap();
+    let formats = ["image/jpeg", "image/urf", "image/pwg-raster"]
+        .into_iter()
+        .map(|format| Attribute::text(MIME_MEDIA_TYPE, "document-format-supported", format))
+        .collect::<Vec<_>>();
+    a.splice(format_default..format_default, formats);
+    for format in urf_tokens(p.duplex) {
+        a.push(Attribute::text(KEYWORD, "urf-supported", format));
+    }
+    if p.duplex {
+        a.push(Attribute::text(
+            KEYWORD,
+            "pwg-raster-document-sheet-back",
+            "normal",
+        ));
+    }
+    for member in [
+        "media-size",
+        "media-size-name",
+        "media-bottom-margin",
+        "media-left-margin",
+        "media-right-margin",
+        "media-top-margin",
+    ] {
+        a.push(Attribute::text(KEYWORD, "media-col-supported", member));
+    }
+    a.push(resolution_attribute("printer-resolution-default"));
+    a.push(resolution_attribute("printer-resolution-supported"));
+    a.push(resolution_attribute(
+        "pwg-raster-document-resolution-supported",
+    ));
     for paper in &p.paper_sizes {
         a.push(Attribute::text(KEYWORD, "media-supported", paper.keyword()));
     }
@@ -798,6 +1158,8 @@ fn printer_group(p: &SharedPrinter, uri: &str, authentication_required: bool) ->
     for op in [
         PRINT_JOB,
         VALIDATE_JOB,
+        CREATE_JOB,
+        SEND_DOCUMENT,
         CANCEL_JOB,
         GET_JOB_ATTRIBUTES,
         GET_JOBS,
@@ -816,9 +1178,11 @@ fn printer_group(p: &SharedPrinter, uri: &str, authentication_required: bool) ->
 fn job_group(j: &Job, printer_uri: &str) -> Group {
     let (state, reason) = match j.state.as_str() {
         "pending" => (3, "none"),
+        "pending-document" | "pending-final-document" => (3, "job-incoming"),
         "processing" => (5, "job-printing"),
         "submitted" => (9, "queued-in-device"),
         "simulated" => (9, "job-completed-successfully"),
+        "completed" => (9, "job-completed-successfully"),
         "failed" => (8, "aborted-by-system"),
         "uncertain" => (6, "job-stopped"),
         "canceled" => (7, "job-canceled-by-user"),
@@ -837,6 +1201,7 @@ fn job_group(j: &Job, printer_uri: &str) -> Group {
             Attribute::integer(INTEGER, "copies", j.copies as i32),
             Attribute::text(KEYWORD, "sides", &j.sides),
             Attribute::text(KEYWORD, "media", j.paper.keyword()),
+            Attribute::text(KEYWORD, "print-color-mode", &j.color_mode),
         ],
     )
 }
@@ -925,6 +1290,27 @@ mod tests {
         encode((1, 1), operation, 17, &[group], pdf).unwrap()
     }
 
+    fn media_col(paper: PaperSize) -> Attribute {
+        let mut bytes = Vec::new();
+        collection_field(&mut bytes, MEMBER_ATTR_NAME, "", b"media-size");
+        collection_field(&mut bytes, BEGIN_COLLECTION, "", &[]);
+        let (width, height) = paper.dimensions();
+        for (name, value) in [
+            ("x-dimension", width.to_be_bytes()),
+            ("y-dimension", height.to_be_bytes()),
+        ] {
+            collection_field(&mut bytes, MEMBER_ATTR_NAME, "", name.as_bytes());
+            collection_field(&mut bytes, INTEGER, "", &value);
+        }
+        collection_field(&mut bytes, END_COLLECTION, "", &[]);
+        collection_field(&mut bytes, END_COLLECTION, "", &[]);
+        Attribute {
+            tag: BEGIN_COLLECTION,
+            name: "media-col".into(),
+            value: bytes,
+        }
+    }
+
     #[test]
     fn native_and_ipp_paper_and_duplex_options_agree_and_persist() {
         let (_directory, bridge, device) = fixture();
@@ -936,7 +1322,13 @@ mod tests {
         let message = parse(&defaults).unwrap();
         assert_eq!(
             options(&message, &printer).unwrap(),
-            (1, "one-sided", PaperSize::Letter)
+            (1, "one-sided", PaperSize::Letter, "auto".into())
+        );
+        let media_col_request =
+            request_bytes(VALIDATE_JOB, "office", vec![media_col(PaperSize::A5)], &[]);
+        assert_eq!(
+            options(&parse(&media_col_request).unwrap(), &printer).unwrap(),
+            (1, "one-sided", PaperSize::A5, "auto".into())
         );
         for paper in crate::media::PAPER_SIZES {
             for (sides, native) in [
@@ -963,7 +1355,7 @@ mod tests {
                     let bytes = request_bytes(VALIDATE_JOB, "office", attributes, &[]);
                     assert_eq!(
                         options(&parse(&bytes).unwrap(), &printer).unwrap(),
-                        (1, sides, paper)
+                        (1, sides, paper, "auto".into())
                     );
                 }
             }
@@ -977,6 +1369,7 @@ mod tests {
                 Attribute::text(KEYWORD, "sides", "two-sided-short-edge"),
                 Attribute::text(NAME, "Duplex", "DuplexTumble"),
                 Attribute::integer(INTEGER, "copies", 2),
+                Attribute::text(KEYWORD, "print-color-mode", "color"),
             ],
             &pdf_bytes(),
         );
@@ -994,6 +1387,57 @@ mod tests {
         assert_eq!(job.paper, PaperSize::Letter);
         assert_eq!(job.sides, "two-sided-short-edge");
         assert_eq!(job.copies, 2);
+        assert_eq!(job.color_mode, "color");
+        assert_eq!(text(&response, "print-color-mode"), Some("color"));
+    }
+
+    #[test]
+    fn validates_standard_and_legacy_ppd_color_modes() {
+        let (_directory, bridge, _) = fixture();
+        let printer = bridge.printer("office").unwrap();
+        for mode in ["auto", "color", "monochrome"] {
+            let bytes = request_bytes(
+                VALIDATE_JOB,
+                "office",
+                vec![Attribute::text(KEYWORD, "print-color-mode", mode)],
+                &[],
+            );
+            assert_eq!(options(&parse(&bytes).unwrap(), &printer).unwrap().3, mode);
+        }
+        let gray = request_bytes(
+            VALIDATE_JOB,
+            "office",
+            vec![Attribute::text(NAME, "ColorModel", "Gray")],
+            &[],
+        );
+        assert_eq!(
+            options(&parse(&gray).unwrap(), &printer).unwrap().3,
+            "monochrome"
+        );
+        let rgb = request_bytes(
+            VALIDATE_JOB,
+            "office",
+            vec![Attribute::text(NAME, "ColorModel", "RGB")],
+            &[],
+        );
+        assert_eq!(options(&parse(&rgb).unwrap(), &printer).unwrap().3, "color");
+        for attributes in [
+            vec![
+                Attribute::text(KEYWORD, "print-color-mode", "color"),
+                Attribute::text(NAME, "ColorModel", "Gray"),
+            ],
+            vec![
+                Attribute::text(KEYWORD, "print-color-mode", "auto"),
+                Attribute::text(NAME, "ColorModel", "RGB"),
+            ],
+            vec![Attribute::text(KEYWORD, "print-color-mode", "draft")],
+        ] {
+            assert!(options(
+                &parse(&request_bytes(VALIDATE_JOB, "office", attributes, &[])).unwrap(),
+                &printer
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -1369,7 +1813,7 @@ mod tests {
         let pdf = pdf_bytes();
         for (document, expected) in [
             (pdf.as_slice(), SUCCESSFUL_OK),
-            (b"not a PDF".as_slice(), CLIENT_ERROR_NOT_POSSIBLE),
+            (b"not a PDF".as_slice(), CLIENT_ERROR_DOCUMENT_FORMAT_ERROR),
         ] {
             let bytes = encode((2, 0), PRINT_JOB, 17, &groups, document).unwrap();
             let response = dispatch(
@@ -1455,6 +1899,8 @@ mod tests {
                 vec![
                     PRINT_JOB,
                     VALIDATE_JOB,
+                    CREATE_JOB,
+                    SEND_DOCUMENT,
                     CANCEL_JOB,
                     GET_JOB_ATTRIBUTES,
                     GET_JOBS,
@@ -1465,11 +1911,77 @@ mod tests {
                 text(&response, "document-format-supported"),
                 Some("application/pdf")
             );
+            assert!(
+                text(&response, "printer-uuid").is_some_and(|uuid| uuid.starts_with("urn:uuid:"))
+            );
+            let mut formats: Vec<_> = response
+                .attributes("document-format-supported")
+                .map(|attribute| attribute.as_str().unwrap())
+                .collect();
+            formats.sort_unstable();
+            assert_eq!(
+                formats,
+                vec![
+                    "application/pdf",
+                    "image/jpeg",
+                    "image/pwg-raster",
+                    "image/urf"
+                ]
+            );
             assert_eq!(
                 text(&response, "uri-authentication-supported"),
                 Some("basic")
             );
             assert_eq!(response.attributes("sides-supported").count(), 3);
+            assert_eq!(
+                response
+                    .attributes("print-color-mode-supported")
+                    .filter_map(Attribute::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["auto", "color", "monochrome"]
+            );
+            assert_eq!(response.attribute("color-supported").unwrap().value, [1]);
+            assert_eq!(
+                response
+                    .attributes("urf-supported")
+                    .filter_map(Attribute::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["W8", "SRGB24", "RS300", "DM1"]
+            );
+            assert_eq!(
+                response.attributes("printer-resolution-supported").count(),
+                1
+            );
+            assert_eq!(
+                response
+                    .attribute("printer-resolution-default")
+                    .unwrap()
+                    .tag,
+                RESOLUTION
+            );
+            assert_eq!(
+                text(&response, "pwg-raster-document-sheet-back"),
+                Some("normal")
+            );
+            assert_eq!(response.attributes("media-col-supported").count(), 6);
+            assert_eq!(
+                response.attribute("media-col-default").unwrap().tag,
+                BEGIN_COLLECTION
+            );
+            assert_eq!(response.attributes("media-col-database").count(), 1);
+            for name in [
+                b"document-format-supported".as_slice(),
+                b"media-col-database".as_slice(),
+                b"urf-supported".as_slice(),
+            ] {
+                assert_eq!(
+                    bytes
+                        .windows(name.len())
+                        .filter(|window| *window == name)
+                        .count(),
+                    1
+                );
+            }
             // Multi-valued attributes must use one name followed by zero-name values.
             assert_eq!(
                 bytes
@@ -1549,6 +2061,66 @@ mod tests {
     }
 
     #[test]
+    fn create_job_waits_for_send_document_before_becoming_printable() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, device) = fixture();
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                CREATE_JOB,
+                vec![Attribute::integer(INTEGER, "copies", 2)],
+                &[],
+            )
+            .await;
+            let created = parse(&bytes).unwrap();
+            let id = created.attribute("job-id").unwrap().as_i32().unwrap();
+            assert_eq!(created.code, SUCCESSFUL_OK);
+            assert_eq!(created.attribute("job-state").unwrap().as_i32(), Some(3));
+            assert_eq!(bridge.job(id as i64).unwrap().state, "pending-document");
+
+            let job_uri = format!("ipp://localhost/ipp/printers/office/jobs/{id}");
+            let attrs = vec![
+                Attribute::text(URI, "job-uri", &job_uri),
+                Attribute::text(MIME_MEDIA_TYPE, "document-format", "application/pdf"),
+                Attribute::boolean("last-document", false),
+            ];
+            let bytes = call(
+                &bridge,
+                &device,
+                "office",
+                SEND_DOCUMENT,
+                attrs,
+                &pdf_bytes(),
+            )
+            .await;
+            assert_eq!(parse(&bytes).unwrap().code, SUCCESSFUL_OK);
+            assert_eq!(
+                bridge.job(id as i64).unwrap().state,
+                "pending-final-document"
+            );
+
+            let attrs = vec![
+                Attribute::text(URI, "job-uri", &job_uri),
+                Attribute::boolean("last-document", true),
+            ];
+            let bytes = call(&bridge, &device, "office", SEND_DOCUMENT, attrs, &[]).await;
+            assert_eq!(parse(&bytes).unwrap().code, SUCCESSFUL_OK);
+            assert_eq!(bridge.job(id as i64).unwrap().state, "pending");
+
+            let other = bridge.create_device("Other Mac".into()).unwrap();
+            let attrs = vec![
+                Attribute::text(URI, "job-uri", &job_uri),
+                Attribute::boolean("last-document", true),
+            ];
+            let bytes = call(&bridge, &other, "office", SEND_DOCUMENT, attrs, &[]).await;
+            assert_eq!(parse(&bytes).unwrap().code, CLIENT_ERROR_NOT_FOUND);
+            assert_eq!(bridge.job(id as i64).unwrap().state, "pending");
+            bridge.cancel_job(id as i64).unwrap();
+        });
+    }
+
+    #[test]
     fn isolates_queries_and_cancellation_by_device_and_printer() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (_directory, bridge, device) = fixture();
@@ -1599,7 +2171,7 @@ mod tests {
             for (attribute, status) in [
                 (
                     Attribute::text(MIME_MEDIA_TYPE, "document-format", "image/pwg-raster"),
-                    CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED,
+                    CLIENT_ERROR_DOCUMENT_FORMAT_ERROR,
                 ),
                 (
                     Attribute::integer(INTEGER, "copies", 0),
@@ -1630,10 +2202,6 @@ mod tests {
                     CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
                 ),
                 (
-                    Attribute::text(NAME, "ColorModel", "RGB"),
-                    CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-                ),
-                (
                     Attribute::text(NAME, "Duplex", "InvalidDuplex"),
                     CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
                 ),
@@ -1653,7 +2221,7 @@ mod tests {
                 .await;
                 assert_eq!(parse(&bytes).unwrap().code, status);
             }
-            let bytes = call(&bridge, &device, "office", 0x0005, vec![], &[]).await;
+            let bytes = call(&bridge, &device, "office", 0x0007, vec![], &[]).await;
             assert_eq!(
                 parse(&bytes).unwrap().code,
                 SERVER_ERROR_OPERATION_NOT_SUPPORTED

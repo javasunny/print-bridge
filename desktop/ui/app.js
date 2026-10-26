@@ -1,4 +1,4 @@
-import { stateLabel, canCancel, printerSetup, printerFromForm, connectionResult, authenticationNotice } from './model.mjs';
+import { stateLabel, canCancel, printerSetup, printerFromForm, connectionResult, authenticationNotice, discoveryNotice } from './model.mjs';
 
 const $ = (id) => document.getElementById(id);
 const invoke = (command, args = {}) => window.__TAURI__.core.invoke(command, args);
@@ -49,6 +49,7 @@ async function refreshStatus() {
   $('mode').textContent = service.simulation ? '模拟模式 · 不真实打印' : 'Windows 本机';
   $('service-state').textContent = service.running ? 'IPP 服务运行中' : '服务未启动';
   $('service-address').textContent = service.address || '仅在可信局域网使用';
+  $('discovery-note').textContent = discoveryNotice(service);
   $('lamp').classList.toggle('running', service.running);
   $('start').disabled = service.running;
   $('stop').disabled = !service.running;
@@ -144,7 +145,7 @@ async function refreshConnections() {
   connectionSnapshot = snapshot;
   const list = $('connection-list');
   if (!events.length) { empty(list, '尚未收到请求。在 Mac 查询或打印后，来源 IP 和结果会显示在这里。'); return; }
-  const operations = { 2: ['提交打印任务', 'Print-Job'], 4: ['验证打印参数', 'Validate-Job'], 8: ['取消任务', 'Cancel-Job'], 9: ['查询任务状态', 'Get-Job-Attributes'], 10: ['查询任务列表', 'Get-Jobs'], 11: ['查询打印机', 'Get-Printer-Attributes'] };
+  const operations = { 2: ['提交打印任务', 'Print-Job'], 4: ['验证打印参数', 'Validate-Job'], 5: ['创建等待任务', 'Create-Job'], 6: ['上传打印文档', 'Send-Document'], 8: ['取消任务', 'Cancel-Job'], 9: ['查询任务状态', 'Get-Job-Attributes'], 10: ['查询任务列表', 'Get-Jobs'], 11: ['查询打印机', 'Get-Printer-Attributes'] };
   const { el, body } = table(['时间', '客户端', '操作 / 路径', '结果', '协议状态', '详情']);
   for (const event of events) {
     const row = body.insertRow();
@@ -254,8 +255,11 @@ $('device-form').addEventListener('submit', (event) => { event.preventDefault();
 window.addEventListener('pagehide', hideSecret);
 setInterval(() => {
   if (!window.__TAURI__ || document.hidden) return;
-  if (!$('connections').hidden) action(refreshConnections);
-  else if (!$('jobs').hidden) action(refreshJobs);
+  action(async () => {
+    if (service.running) await refreshStatus();
+    if (!$('connections').hidden) await refreshConnections();
+    else if (!$('jobs').hidden) await refreshJobs();
+  });
 }, 2000);
 if (window.__TAURI__) action(async () => {
   await window.__TAURI__.event.listen('hide-secret', hideSecret);

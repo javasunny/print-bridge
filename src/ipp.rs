@@ -2,6 +2,8 @@
 
 pub const PRINT_JOB: u16 = 0x0002;
 pub const VALIDATE_JOB: u16 = 0x0004;
+pub const CREATE_JOB: u16 = 0x0005;
+pub const SEND_DOCUMENT: u16 = 0x0006;
 pub const CANCEL_JOB: u16 = 0x0008;
 pub const GET_JOB_ATTRIBUTES: u16 = 0x0009;
 pub const GET_JOBS: u16 = 0x000a;
@@ -16,11 +18,13 @@ pub const CLIENT_ERROR_NOT_POSSIBLE: u16 = 0x0404;
 pub const CLIENT_ERROR_NOT_FOUND: u16 = 0x0406;
 pub const CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED: u16 = 0x040a;
 pub const CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED: u16 = 0x040b;
+pub const CLIENT_ERROR_DOCUMENT_FORMAT_ERROR: u16 = 0x0411;
 pub const SERVER_ERROR_INTERNAL_ERROR: u16 = 0x0500;
 pub const SERVER_ERROR_OPERATION_NOT_SUPPORTED: u16 = 0x0501;
 pub const SERVER_ERROR_SERVICE_UNAVAILABLE: u16 = 0x0502;
 pub const SERVER_ERROR_VERSION_NOT_SUPPORTED: u16 = 0x0503;
 pub const SERVER_ERROR_BUSY: u16 = 0x0507;
+pub const SERVER_ERROR_MULTIPLE_DOCUMENT_JOBS_NOT_SUPPORTED: u16 = 0x050d;
 
 pub const OPERATION_ATTRIBUTES: u8 = 0x01;
 pub const JOB_ATTRIBUTES: u8 = 0x02;
@@ -31,6 +35,7 @@ pub const BOOLEAN: u8 = 0x22;
 pub const ENUM: u8 = 0x23;
 pub const OCTET_STRING: u8 = 0x30;
 pub const RANGE_OF_INTEGER: u8 = 0x33;
+pub const RESOLUTION: u8 = 0x32;
 pub const BEGIN_COLLECTION: u8 = 0x34;
 pub const END_COLLECTION: u8 = 0x37;
 pub const TEXT: u8 = 0x41;
@@ -41,6 +46,18 @@ pub const CHARSET: u8 = 0x47;
 pub const NATURAL_LANGUAGE: u8 = 0x48;
 pub const MIME_MEDIA_TYPE: u8 = 0x49;
 pub const MEMBER_ATTR_NAME: u8 = 0x4a;
+
+pub(crate) fn urf_supported(duplex: bool) -> String {
+    urf_tokens(duplex).join(",")
+}
+
+pub(crate) fn urf_tokens(duplex: bool) -> &'static [&'static str] {
+    if duplex {
+        &["W8", "SRGB24", "RS300", "DM1"]
+    } else {
+        &["W8", "SRGB24", "RS300"]
+    }
+}
 
 pub const MAX_ATTRIBUTES: usize = 256;
 pub const MAX_GROUPS: usize = 64;
@@ -300,18 +317,24 @@ pub fn parse(bytes: &[u8]) -> Result<Message<'_>, Error> {
             if !value.is_empty() {
                 return Err(Error("invalid collection start"));
             }
+            let collection_start = cursor;
             skip_collection(bytes, &mut cursor, 1)?;
+            group.attributes.push(Attribute {
+                tag,
+                name,
+                value: bytes[collection_start..cursor].to_vec(),
+            });
         } else {
             validate_value(tag, value)?;
+            group.attributes.push(Attribute {
+                tag,
+                name,
+                value: value.to_vec(),
+            });
         }
         if cursor - 8 >= MAX_ATTRIBUTE_BYTES {
             return Err(Error("attributes exceed size limit"));
         }
-        group.attributes.push(Attribute {
-            tag,
-            name,
-            value: value.to_vec(),
-        });
     }
 }
 
@@ -347,7 +370,11 @@ pub fn encode(
         let mut previous: Option<&Attribute> = None;
         for attribute in &group.attributes {
             validate_name(&attribute.name)?;
-            validate_value(attribute.tag, &attribute.value)?;
+            if attribute.tag != BEGIN_COLLECTION {
+                validate_value(attribute.tag, &attribute.value)?;
+            } else if attribute.value.is_empty() || attribute.value.len() > i16::MAX as usize {
+                return Err(Error("invalid collection value"));
+            }
             if attribute.value.len() > i16::MAX as usize {
                 return Err(Error("attribute value too long"));
             }
@@ -357,8 +384,13 @@ pub fn encode(
             let name = if additional { "" } else { &attribute.name };
             bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
             bytes.extend_from_slice(name.as_bytes());
-            bytes.extend_from_slice(&(attribute.value.len() as u16).to_be_bytes());
-            bytes.extend_from_slice(&attribute.value);
+            if attribute.tag == BEGIN_COLLECTION {
+                bytes.extend_from_slice(&0u16.to_be_bytes());
+                bytes.extend_from_slice(&attribute.value);
+            } else {
+                bytes.extend_from_slice(&(attribute.value.len() as u16).to_be_bytes());
+                bytes.extend_from_slice(&attribute.value);
+            }
             if bytes.len() - 8 >= MAX_ATTRIBUTE_BYTES {
                 return Err(Error("attributes exceed size limit"));
             }
@@ -407,6 +439,48 @@ mod tests {
         assert_eq!(parsed.attribute("copies").unwrap().as_i32(), Some(2));
         assert_eq!(parsed.attributes("sides-supported").count(), 2);
         assert_eq!(parsed.request_id, 9);
+    }
+
+    #[test]
+    fn roundtrips_media_collection_members() {
+        fn field(bytes: &mut Vec<u8>, tag: u8, name: &[u8], value: &[u8]) {
+            bytes.push(tag);
+            bytes.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(name);
+            bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(value);
+        }
+
+        let mut collection = Vec::new();
+        field(&mut collection, MEMBER_ATTR_NAME, &[], b"media-size");
+        field(&mut collection, BEGIN_COLLECTION, &[], &[]);
+        let width = 21000i32.to_be_bytes();
+        let height = 29700i32.to_be_bytes();
+        for (name, value) in [
+            (b"x-dimension".as_slice(), width.as_slice()),
+            (b"y-dimension".as_slice(), height.as_slice()),
+        ] {
+            field(&mut collection, MEMBER_ATTR_NAME, &[], name);
+            field(&mut collection, INTEGER, &[], value);
+        }
+        field(&mut collection, END_COLLECTION, &[], &[]);
+        field(&mut collection, END_COLLECTION, &[], &[]);
+        let groups = vec![
+            operation_attributes(),
+            Group::new(
+                PRINTER_ATTRIBUTES,
+                vec![Attribute {
+                    tag: BEGIN_COLLECTION,
+                    name: "media-col-default".into(),
+                    value: collection.clone(),
+                }],
+            ),
+        ];
+        let bytes = encode((2, 0), GET_PRINTER_ATTRIBUTES, 12, &groups, &[]).unwrap();
+        let parsed = parse(&bytes).unwrap();
+        let attribute = parsed.attribute("media-col-default").unwrap();
+        assert_eq!(attribute.tag, BEGIN_COLLECTION);
+        assert_eq!(attribute.value, collection);
     }
 
     #[test]

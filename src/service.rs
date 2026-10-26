@@ -1,14 +1,15 @@
 use crate::{
     ipp::*,
+    media::PaperSize,
     store::{now, Bridge, ConnectionEvent, Job, SharedPrinter, ANONYMOUS_DEVICE, MAX_PDF},
 };
 use axum::{
     body::to_bytes,
-    extract::{ConnectInfo, Request, State},
+    extract::{ConnectInfo, Path, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -55,11 +56,32 @@ pub(crate) fn router(bridge: Arc<Bridge>) -> Router {
     Router::new()
         .route("/ipp/printers/{printer}", post(handle))
         .route("/ipp/printers/{printer}/jobs/{job}", post(handle))
+        .route("/ipp/printers/{printer}/driver.ppd", get(download_ppd))
         .with_state(Server {
             bridge: Arc::clone(&bridge),
             uploads: Arc::new(Semaphore::new(4)),
         })
         .layer(middleware::from_fn_with_state(bridge, record_connection))
+}
+async fn download_ppd(State(server): State<Server>, Path(id): Path<String>) -> Response {
+    if !server.bridge.running.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Ok(printer) = server.bridge.printer(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/vnd.cups-ppd".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"Print-Bridge-{id}.ppd\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        crate::ppd::generate(&printer),
+    )
+        .into_response()
 }
 async fn record_connection(
     State(bridge): State<Arc<Bridge>>,
@@ -254,7 +276,7 @@ fn collection_field(bytes: &mut Vec<u8>, tag: u8, name: &str, value: &[u8]) {
     bytes.extend_from_slice(value);
 }
 
-fn media_collection(bytes: &mut Vec<u8>, name: &str) {
+fn media_collection(bytes: &mut Vec<u8>, name: &str, paper: PaperSize) {
     collection_field(bytes, BEGIN_COLLECTION, name, &[]);
     for margin in [
         "media-bottom-margin",
@@ -267,7 +289,8 @@ fn media_collection(bytes: &mut Vec<u8>, name: &str) {
     }
     collection_field(bytes, MEMBER_ATTR_NAME, "", b"media-size");
     collection_field(bytes, BEGIN_COLLECTION, "", &[]);
-    for (member, dimension) in [("x-dimension", 21000i32), ("y-dimension", 29700)] {
+    let (width, height) = paper.dimensions();
+    for (member, dimension) in [("x-dimension", width), ("y-dimension", height)] {
         collection_field(bytes, MEMBER_ATTR_NAME, "", member.as_bytes());
         collection_field(bytes, INTEGER, "", &dimension.to_be_bytes());
     }
@@ -288,8 +311,14 @@ fn printer_reply(
         "",
     );
     assert_eq!(bytes.pop(), Some(0x03));
-    media_collection(&mut bytes, "media-col-default");
-    media_collection(&mut bytes, "media-col-database");
+    media_collection(&mut bytes, "media-col-default", printer.default_paper);
+    for (index, paper) in printer.paper_sizes.iter().enumerate() {
+        media_collection(
+            &mut bytes,
+            if index == 0 { "media-col-database" } else { "" },
+            *paper,
+        );
+    }
     bytes.push(0x03);
     bytes
 }
@@ -409,14 +438,14 @@ fn dispatch(bridge: &Bridge, device: &str, host: &str, path: &str, bytes: &[u8])
             if !printer.enabled {
                 return fail(SERVER_ERROR_SERVICE_UNAVAILABLE, "Printer disabled");
             }
-            let (copies, sides) = match options(&message, &printer) {
+            let (copies, sides, paper) = match options(&message, &printer) {
                 Ok(o) => o,
                 Err((code, s)) => return fail(code, &s),
             };
             if message.code == VALIDATE_JOB {
                 return reply(&message, SUCCESSFUL_OK, vec![], "");
             }
-            match bridge.accept(device, &printer.id, copies, sides, message.document) {
+            match bridge.accept(device, &printer.id, copies, sides, paper, message.document) {
                 Ok(job) => reply(&message, SUCCESSFUL_OK, vec![job_group(&job, &uri)], ""),
                 Err(error) => fail(CLIENT_ERROR_NOT_POSSIBLE, &error),
             }
@@ -495,7 +524,10 @@ fn uri_path(uri: &str) -> Option<&str> {
     let (_, path) = rest.split_once('/')?;
     Some(&rest[rest.len() - path.len() - 1..])
 }
-fn options<'a>(m: &'a Message<'_>, p: &SharedPrinter) -> Result<(u32, &'a str), (u16, String)> {
+fn options<'a>(
+    m: &'a Message<'_>,
+    p: &SharedPrinter,
+) -> Result<(u32, &'a str, PaperSize), (u16, String)> {
     for (name, tag) in [
         ("document-format", MIME_MEDIA_TYPE),
         ("sides", KEYWORD),
@@ -577,12 +609,46 @@ fn options<'a>(m: &'a Message<'_>, p: &SharedPrinter) -> Result<(u32, &'a str), 
         }
         None => 1,
     };
-    let sides = text(m, "sides").unwrap_or("one-sided");
+    let unsupported = |detail: &str| {
+        (
+            CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
+            detail.to_owned(),
+        )
+    };
+    let duplex_sides = |value| match value {
+        "None" => Some("one-sided"),
+        "DuplexNoTumble" => Some("two-sided-long-edge"),
+        "DuplexTumble" => Some("two-sided-short-edge"),
+        _ => None,
+    };
+    let native_sides = text(m, "Duplex")
+        .map(|value| duplex_sides(value).ok_or_else(|| unsupported("Unsupported value for Duplex")))
+        .transpose()?;
+    let sides = text(m, "sides").or(native_sides).unwrap_or("one-sided");
+    if m.attributes("Duplex")
+        .any(|a| a.tag != NAME || a.as_str().and_then(duplex_sides) != Some(sides))
+    {
+        return Err(unsupported("Unsupported or conflicting value for Duplex"));
+    }
+    let media = text(m, "media")
+        .map(|value| PaperSize::parse(value).ok_or_else(|| unsupported("Unsupported media")))
+        .transpose()?;
+    let page_size = text(m, "PageSize")
+        .map(|value| PaperSize::parse(value).ok_or_else(|| unsupported("Unsupported PageSize")))
+        .transpose()?;
+    let paper = media.or(page_size).unwrap_or(p.default_paper);
+    if media.is_some() && page_size.is_some() && media != page_size {
+        return Err(unsupported("Conflicting media and PageSize"));
+    }
+    if m.attributes("PageSize")
+        .any(|a| a.tag != NAME || a.as_str().and_then(PaperSize::parse) != Some(paper))
+    {
+        return Err(unsupported("Unsupported or conflicting PageSize"));
+    }
     for (name, tag, value) in [
         ("AP_ColorMatchingMode", NAME, "AP_ApplicationColorMatching"),
         ("AP_D_InputSlot", NAME, ""),
         ("ColorModel", NAME, "Gray"),
-        ("Duplex", NAME, "None"),
         ("pserrorhandler-requested", NAME, "standard"),
         ("job-hold-until", KEYWORD, "no-hold"),
     ] {
@@ -596,10 +662,6 @@ fn options<'a>(m: &'a Message<'_>, p: &SharedPrinter) -> Result<(u32, &'a str), 
         }
     }
     for (name, unsupported) in [
-        (
-            "Duplex",
-            m.attribute("Duplex").is_some() && sides != "one-sided",
-        ),
         (
             "collate",
             m.attributes("collate")
@@ -638,16 +700,8 @@ fn options<'a>(m: &'a Message<'_>, p: &SharedPrinter) -> Result<(u32, &'a str), 
             ));
         }
     }
-    if text(m, "media").is_some_and(|s| !matches!(s, "iso_a4_210x297mm" | "A4")) {
-        return Err((
-            CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-            "Only A4 is supported".into(),
-        ));
-    }
-    if m.attributes("PageSize")
-        .any(|a| a.tag != NAME || a.as_str() != Some("A4"))
-        || m.attributes("number-up")
-            .any(|a| a.tag != INTEGER || a.as_i32() != Some(1))
+    if m.attributes("number-up")
+        .any(|a| a.tag != INTEGER || a.as_i32() != Some(1))
         || m.attributes("finishings")
             .any(|a| a.tag != ENUM || a.as_i32() != Some(3))
     {
@@ -672,13 +726,13 @@ fn options<'a>(m: &'a Message<'_>, p: &SharedPrinter) -> Result<(u32, &'a str), 
             ));
         }
     }
-    Bridge::validate_options(p, copies, sides).map_err(|_| {
+    Bridge::validate_options(p, copies, sides, paper).map_err(|error| {
         (
             CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
-            "Unsupported copies or sides".into(),
+            format!("Unsupported copies, sides or media: {error}"),
         )
     })?;
-    Ok((copies, sides))
+    Ok((copies, sides, paper))
 }
 fn printer_group(p: &SharedPrinter, uri: &str, authentication_required: bool) -> Group {
     let mut a = vec![
@@ -723,8 +777,7 @@ fn printer_group(p: &SharedPrinter, uri: &str, authentication_required: bool) ->
             "document-format-default",
             "application/pdf",
         ),
-        Attribute::text(KEYWORD, "media-supported", "iso_a4_210x297mm"),
-        Attribute::text(KEYWORD, "media-default", "iso_a4_210x297mm"),
+        Attribute::text(KEYWORD, "media-default", p.default_paper.keyword()),
         Attribute::integer(INTEGER, "media-bottom-margin-supported", 0),
         Attribute::integer(INTEGER, "media-left-margin-supported", 0),
         Attribute::integer(INTEGER, "media-right-margin-supported", 0),
@@ -734,6 +787,9 @@ fn printer_group(p: &SharedPrinter, uri: &str, authentication_required: bool) ->
         Attribute::boolean("multiple-document-jobs-supported", false),
         Attribute::text(KEYWORD, "compression-supported", "none"),
     ];
+    for paper in &p.paper_sizes {
+        a.push(Attribute::text(KEYWORD, "media-supported", paper.keyword()));
+    }
     a.push(Attribute {
         tag: RANGE_OF_INTEGER,
         name: "copies-supported".into(),
@@ -780,6 +836,7 @@ fn job_group(j: &Job, printer_uri: &str) -> Group {
             Attribute::text(NAME, "job-originating-user-name", &j.device_id),
             Attribute::integer(INTEGER, "copies", j.copies as i32),
             Attribute::text(KEYWORD, "sides", &j.sides),
+            Attribute::text(KEYWORD, "media", j.paper.keyword()),
         ],
     )
 }
@@ -866,6 +923,166 @@ mod tests {
         ));
         group.attributes.extend(extra);
         encode((1, 1), operation, 17, &[group], pdf).unwrap()
+    }
+
+    #[test]
+    fn native_and_ipp_paper_and_duplex_options_agree_and_persist() {
+        let (_directory, bridge, device) = fixture();
+        let mut printer = bridge.printer("office").unwrap();
+        printer.paper_sizes = crate::media::PAPER_SIZES.to_vec();
+        printer.default_paper = PaperSize::Letter;
+        bridge.save_printer(printer.clone()).unwrap();
+        let defaults = request_bytes(VALIDATE_JOB, "office", vec![], &[]);
+        let message = parse(&defaults).unwrap();
+        assert_eq!(
+            options(&message, &printer).unwrap(),
+            (1, "one-sided", PaperSize::Letter)
+        );
+        for paper in crate::media::PAPER_SIZES {
+            for (sides, native) in [
+                ("one-sided", "None"),
+                ("two-sided-long-edge", "DuplexNoTumble"),
+                ("two-sided-short-edge", "DuplexTumble"),
+            ] {
+                for attributes in [
+                    vec![
+                        Attribute::text(KEYWORD, "media", paper.keyword()),
+                        Attribute::text(KEYWORD, "sides", sides),
+                    ],
+                    vec![
+                        Attribute::text(NAME, "PageSize", paper.name()),
+                        Attribute::text(NAME, "Duplex", native),
+                    ],
+                    vec![
+                        Attribute::text(KEYWORD, "media", paper.name()),
+                        Attribute::text(NAME, "PageSize", paper.name()),
+                        Attribute::text(KEYWORD, "sides", sides),
+                        Attribute::text(NAME, "Duplex", native),
+                    ],
+                ] {
+                    let bytes = request_bytes(VALIDATE_JOB, "office", attributes, &[]);
+                    assert_eq!(
+                        options(&parse(&bytes).unwrap(), &printer).unwrap(),
+                        (1, sides, paper)
+                    );
+                }
+            }
+        }
+        let request = request_bytes(
+            PRINT_JOB,
+            "office",
+            vec![
+                Attribute::text(KEYWORD, "media", "na_letter_8.5x11in"),
+                Attribute::text(NAME, "PageSize", "Letter"),
+                Attribute::text(KEYWORD, "sides", "two-sided-short-edge"),
+                Attribute::text(NAME, "Duplex", "DuplexTumble"),
+                Attribute::integer(INTEGER, "copies", 2),
+            ],
+            &pdf_bytes(),
+        );
+        let bytes = dispatch(
+            &bridge,
+            &device.device.id,
+            "localhost",
+            "/ipp/printers/office",
+            &request,
+        );
+        let response = parse(&bytes).unwrap();
+        assert_eq!(response.code, SUCCESSFUL_OK);
+        assert_eq!(text(&response, "media"), Some(PaperSize::Letter.keyword()));
+        let job = bridge.list_jobs().unwrap().remove(0);
+        assert_eq!(job.paper, PaperSize::Letter);
+        assert_eq!(job.sides, "two-sided-short-edge");
+        assert_eq!(job.copies, 2);
+    }
+
+    #[test]
+    fn rejects_conflicting_unknown_or_unconfigured_paper_and_duplex() {
+        let (_directory, bridge, _) = fixture();
+        let mut printer = bridge.printer("office").unwrap();
+        for attributes in [
+            vec![
+                Attribute::text(KEYWORD, "media", "A4"),
+                Attribute::text(NAME, "PageSize", "A5"),
+            ],
+            vec![Attribute::text(NAME, "PageSize", "A5")],
+            vec![Attribute::text(KEYWORD, "media", "custom_10x20mm")],
+            vec![
+                Attribute::text(NAME, "PageSize", "A4"),
+                Attribute::text(NAME, "PageSize", "Letter"),
+            ],
+            vec![Attribute::integer(INTEGER, "PageSize", 1)],
+            vec![
+                Attribute::text(KEYWORD, "sides", "one-sided"),
+                Attribute::text(NAME, "Duplex", "DuplexNoTumble"),
+            ],
+            vec![
+                Attribute::text(NAME, "Duplex", "None"),
+                Attribute::text(NAME, "Duplex", "DuplexTumble"),
+            ],
+            vec![Attribute::text(KEYWORD, "Duplex", "None")],
+        ] {
+            let bytes = request_bytes(VALIDATE_JOB, "office", attributes, &[]);
+            assert_eq!(
+                options(&parse(&bytes).unwrap(), &printer).unwrap_err().0,
+                CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED
+            );
+        }
+        printer.duplex = false;
+        for attributes in [
+            vec![Attribute::text(KEYWORD, "sides", "two-sided-long-edge")],
+            vec![Attribute::text(NAME, "Duplex", "DuplexTumble")],
+        ] {
+            let bytes = request_bytes(VALIDATE_JOB, "office", attributes, &[]);
+            assert!(options(&parse(&bytes).unwrap(), &printer).is_err());
+        }
+        assert!(bridge.list_jobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ppd_download_matches_capabilities_without_credentials() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (_directory, bridge, _) = fixture();
+            let mut printer = bridge.printer("office").unwrap();
+            printer.paper_sizes = vec![PaperSize::A5, PaperSize::Letter];
+            printer.default_paper = PaperSize::A5;
+            for duplex in [false, true] {
+                printer.duplex = duplex;
+                bridge.save_printer(printer.clone()).unwrap();
+                let response = router(Arc::clone(&bridge))
+                    .oneshot(
+                        Request::builder()
+                            .uri("/ipp/printers/office/driver.ppd")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                assert_eq!(
+                    response.headers()[header::CONTENT_TYPE],
+                    "application/vnd.cups-ppd"
+                );
+                let content = to_bytes(response.into_body(), 65536).await.unwrap();
+                let ppd = std::str::from_utf8(&content).unwrap();
+                assert!(ppd.contains("*DefaultPageSize: A5"));
+                assert!(ppd.contains("*PageSize Letter:"));
+                assert!(!ppd.contains("*PageSize A4:"));
+                assert_eq!(ppd.contains("*Duplex DuplexTumble/"), duplex);
+                assert!(!ppd.contains(&printer.queue));
+            }
+            let response = router(Arc::clone(&bridge))
+                .oneshot(
+                    Request::builder()
+                        .uri("/ipp/printers/missing/driver.ppd")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        });
     }
 
     async fn call(
@@ -965,7 +1182,7 @@ mod tests {
                 event.ipp_status,
                 Some(CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED)
             );
-            assert_eq!(event.detail, "Only A4 is supported");
+            assert!(event.detail.contains("media"));
             let serialized = serde_json::to_string(&events).unwrap();
             for secret in [
                 &device.token,
@@ -1417,7 +1634,7 @@ mod tests {
                     CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
                 ),
                 (
-                    Attribute::text(NAME, "Duplex", "DuplexNoTumble"),
+                    Attribute::text(NAME, "Duplex", "InvalidDuplex"),
                     CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED,
                 ),
                 (

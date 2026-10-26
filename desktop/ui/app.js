@@ -68,11 +68,12 @@ async function refreshQueues() {
 }
 function editPrinter(printer) {
   const form = $('printer-form');
-  for (const key of ['id', 'name', 'max_copies']) form.elements[key].value = printer[key];
+  for (const key of ['id', 'name', 'max_copies', 'default_paper']) form.elements[key].value = printer[key];
   if (![...$('queue').options].some((option) => option.value === printer.queue)) $('queue').add(new Option(`${printer.queue}（当前未枚举到）`, printer.queue));
   form.elements.queue.value = printer.queue;
   form.elements.enabled.checked = printer.enabled;
   form.elements.duplex.checked = printer.duplex;
+  for (const input of form.querySelectorAll('[name=paper_sizes]')) input.checked = printer.paper_sizes.includes(input.value);
   form.elements.id.readOnly = true;
   form.elements.name.focus();
 }
@@ -84,11 +85,11 @@ function renderPrinters() {
     const title = node('div', undefined, 'printer-title');
     const heading = node('h3', printer.name); heading.append(badge(printer.enabled ? '已启用' : '已停用'));
     title.append(heading, button('编辑', async () => editPrinter(printer), 'small-button'));
-    card.append(title, node('p', `${printer.queue} · ${printer.duplex ? '支持双面' : '仅单面'} · 最多 ${printer.max_copies} 份`, 'muted'));
+    card.append(title, node('p', `${printer.queue} · ${printer.paper_sizes.join(' / ')}（默认 ${printer.default_paper}） · ${printer.duplex ? '支持双面' : '仅单面'} · 最多 ${printer.max_copies} 份`, 'muted'));
     const setup = printerSetup(service.address || $('address').value.trim(), printer.id);
     if (setup) {
       const fields = node('div', undefined, 'setup-fields');
-      for (const [key, label] of [['address', 'Address · 地址'], ['protocol', 'Protocol · 协议'], ['queue', 'Queue · 队列']]) {
+      for (const [key, label] of [['address', 'Address · 地址'], ['protocol', 'Protocol · 协议'], ['queue', 'Queue · 队列'], ['ppd', 'PPD · 在 Mac 下载驱动']]) {
         const field = node('div', undefined, 'setup-field');
         const value = node('div', undefined, 'copy-field');
         value.append(node('code', setup[key]), button('复制', async () => {
@@ -126,7 +127,7 @@ async function refreshJobs() {
     cell(row, `#${job.id}`, 'identity-cell').append(node('span', printer?.name || job.printer_id, 'secondary'));
     cell(row, job.device_id === 'anonymous' ? '匿名客户端' : job.device_id, 'identity-cell');
     const sides = { 'one-sided': '单面', 'two-sided-long-edge': '双面 · 长边', 'two-sided-short-edge': '双面 · 短边' };
-    cell(row, `${job.copies} 份`, 'options-cell').append(node('span', sides[job.sides] || job.sides, 'secondary'));
+    cell(row, `${job.paper} · ${job.copies} 份`, 'options-cell').append(node('span', sides[job.sides] || job.sides, 'secondary'));
     cell(row, '', 'status-cell').append(badge(stateLabel(job.state), ['uncertain', 'failed'].includes(job.state)));
     cell(row, job.created_at ? time(job.created_at) : '—', 'time-cell');
     cell(row, job.detail || '—', 'details-cell');

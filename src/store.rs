@@ -1,4 +1,7 @@
-use crate::printing::{self, PrintOptions, PrintOutcome};
+use crate::{
+    media::{default_paper_sizes, PaperSize},
+    printing::{self, PrintOptions, PrintOutcome},
+};
 use fs2::FileExt;
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -47,6 +50,10 @@ pub struct SharedPrinter {
     pub enabled: bool,
     pub duplex: bool,
     pub max_copies: u32,
+    #[serde(default = "default_paper_sizes")]
+    pub paper_sizes: Vec<PaperSize>,
+    #[serde(default)]
+    pub default_paper: PaperSize,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Device {
@@ -67,6 +74,7 @@ pub struct Job {
     pub queue: String,
     pub copies: u32,
     pub sides: String,
+    pub paper: PaperSize,
     pub state: String,
     pub detail: String,
     pub created_at: i64,
@@ -129,6 +137,22 @@ impl Bridge {
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,printer_id TEXT NOT NULL,queue TEXT NOT NULL,copies INTEGER NOT NULL,sides TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,file TEXT NOT NULL,digest TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state,id);").map_err(err)?;
+        let has_paper = db
+            .prepare("PRAGMA table_info(jobs)")
+            .map_err(err)?
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(err)?
+            .iter()
+            .any(|column| column == "paper");
+        if !has_paper {
+            db.execute(
+                "ALTER TABLE jobs ADD COLUMN paper TEXT NOT NULL DEFAULT 'A4'",
+                [],
+            )
+            .map_err(err)?;
+        }
         db.execute("UPDATE jobs SET state='uncertain',detail='应用退出前正在调用打印程序，请检查 Windows 队列及出纸情况',updated_at=? WHERE state='processing'", [now()]).map_err(err)?;
         db.execute("DELETE FROM devices WHERE revoked=1", [])
             .map_err(err)?;
@@ -214,9 +238,15 @@ impl Bridge {
             || p.name.len() > 255
             || p.queue.trim().is_empty()
             || p.queue.contains('\0')
+            || p.paper_sizes.is_empty()
+            || !p.paper_sizes.contains(&p.default_paper)
+            || p.paper_sizes
+                .iter()
+                .enumerate()
+                .any(|(index, size)| p.paper_sizes[..index].contains(size))
             || !(1..=99).contains(&p.max_copies)
         {
-            return Err("打印机配置无效：ID 仅允许字母、数字、横线和下划线；份数为 1–99".into());
+            return Err("打印机配置无效：ID 仅允许字母、数字、横线和下划线；份数为 1–99；纸张须非空、无重复且包含默认纸张".into());
         }
         let db = self.db.lock().unwrap();
         let mut stmt = db.prepare("SELECT config FROM printers").map_err(err)?;
@@ -312,7 +342,7 @@ impl Bridge {
     }
     pub fn list_jobs(&self) -> Result<Vec<Job>> {
         let db = self.db.lock().unwrap();
-        let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at FROM jobs ORDER BY id DESC LIMIT 1000").map_err(err)?;
+        let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper FROM jobs ORDER BY id DESC LIMIT 1000").map_err(err)?;
         let result = stmt
             .query_map([], job_row)
             .map_err(err)?
@@ -322,7 +352,7 @@ impl Bridge {
     }
     pub(crate) fn job(&self, id: i64) -> Result<Job> {
         let db = self.db.lock().unwrap();
-        db.query_row("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at FROM jobs WHERE id=?",[id],job_row).map_err(|_|"任务不存在".into())
+        db.query_row("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper FROM jobs WHERE id=?",[id],job_row).map_err(|_|"任务不存在".into())
     }
     pub(crate) fn device_jobs(
         &self,
@@ -332,7 +362,7 @@ impl Bridge {
         limit: i32,
     ) -> Result<Vec<Job>> {
         let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at FROM jobs
+        let mut stmt = db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper FROM jobs
             WHERE device_id=? AND printer_id=? AND (?='all' OR
                 CASE WHEN state IN ('submitted','simulated','failed','canceled') THEN 'completed' ELSE 'not-completed' END=?)
             ORDER BY id DESC LIMIT ?").map_err(err)?;
@@ -365,12 +395,20 @@ impl Bridge {
             Err("仅可取消等待中的任务".into())
         }
     }
-    pub(crate) fn validate_options(p: &SharedPrinter, copies: u32, sides: &str) -> Result<()> {
+    pub(crate) fn validate_options(
+        p: &SharedPrinter,
+        copies: u32,
+        sides: &str,
+        paper: PaperSize,
+    ) -> Result<()> {
         if !p.enabled {
             return Err("打印机已禁用".into());
         }
         if copies == 0 || copies > p.max_copies {
             return Err("不支持的份数".into());
+        }
+        if !p.paper_sizes.contains(&paper) {
+            return Err("不支持的纸张尺寸".into());
         }
         if sides != "one-sided"
             && (!p.duplex || !matches!(sides, "two-sided-long-edge" | "two-sided-short-edge"))
@@ -385,6 +423,7 @@ impl Bridge {
         printer: &str,
         copies: u32,
         sides: &str,
+        paper: PaperSize,
         pdf: &[u8],
     ) -> Result<Job> {
         validate_pdf(pdf)?;
@@ -409,7 +448,7 @@ impl Bridge {
             })
             .map_err(err)?;
         let p: SharedPrinter = serde_json::from_str(&config).map_err(err)?;
-        Self::validate_options(&p, copies, sides)?;
+        Self::validate_options(&p, copies, sides, paper)?;
         let count:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE state IN ('pending','processing','uncertain') AND device_id=?",[device],|r|r.get(0)).map_err(err)?;
         let queue_count:i64=tx.query_row("SELECT COUNT(*) FROM jobs WHERE state IN ('pending','processing','uncertain') AND printer_id=?",[printer],|r|r.get(0)).map_err(err)?;
         if count >= 20 || queue_count >= 100 {
@@ -435,7 +474,7 @@ impl Bridge {
             let _ = fs::remove_file(&path);
             return Err(err(e));
         }
-        let inserted=tx.execute("INSERT INTO jobs(device_id,printer_id,queue,copies,sides,state,created_at,updated_at,file,digest) VALUES(?,?,?,?,?,'pending',?,?,?,?)",params![device,printer,p.queue,copies,sides,now(),now(),name,hash(pdf)]);
+        let inserted=tx.execute("INSERT INTO jobs(device_id,printer_id,queue,copies,sides,paper,state,created_at,updated_at,file,digest) VALUES(?,?,?,?,?,?,'pending',?,?,?,?)",params![device,printer,p.queue,copies,sides,paper.name(),now(),now(),name,hash(pdf)]);
         if let Err(e) = inserted {
             let _ = fs::remove_file(&path);
             return Err(err(e));
@@ -559,10 +598,10 @@ impl Bridge {
         if !self.running.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,file FROM jobs WHERE state='pending' ORDER BY id").map_err(err)?;
+        let mut stmt=db.prepare("SELECT id,device_id,printer_id,queue,copies,sides,state,detail,created_at,paper,file FROM jobs WHERE state='pending' ORDER BY id").map_err(err)?;
         let mut selected = None;
         for row in stmt
-            .query_map([], |r| Ok((job_row(r)?, r.get::<_, String>(9)?)))
+            .query_map([], |r| Ok((job_row(r)?, r.get::<_, String>(10)?)))
             .map_err(err)?
         {
             let (job, file) = row.map_err(err)?;
@@ -571,7 +610,7 @@ impl Bridge {
                 .find(|p| p.id == job.printer_id && p.enabled)
             {
                 if p.queue != job.queue
-                    || Self::validate_options(p, job.copies, &job.sides).is_err()
+                    || Self::validate_options(p, job.copies, &job.sides, job.paper).is_err()
                 {
                     db.execute("UPDATE jobs SET state='failed',detail='目标或能力配置已变更',updated_at=? WHERE id=?",params![now(),job.id]).map_err(err)?;
                     continue;
@@ -605,6 +644,7 @@ impl Bridge {
                 &PrintOptions {
                     copies: job.copies,
                     duplex: job.sides,
+                    paper: job.paper,
                 },
             )
         };
@@ -660,6 +700,10 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         state: r.get(6)?,
         detail: r.get(7)?,
         created_at: r.get(8)?,
+        paper: {
+            let value: String = r.get(9)?;
+            PaperSize::parse(&value).ok_or(rusqlite::Error::InvalidQuery)?
+        },
     })
 }
 fn validate_pdf(bytes: &[u8]) -> Result<()> {
@@ -718,6 +762,8 @@ pub(crate) mod tests {
                 enabled: true,
                 duplex: true,
                 max_copies: 99,
+                paper_sizes: default_paper_sizes(),
+                default_paper: PaperSize::A4,
             })
             .unwrap();
         let device = bridge.create_device("Mac".into()).unwrap();
@@ -725,9 +771,96 @@ pub(crate) mod tests {
         (directory, bridge, device)
     }
 
+    #[test]
+    fn legacy_database_and_printer_config_keep_a4_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("simulation");
+        fs::create_dir_all(&root).unwrap();
+        let db = Connection::open(root.join("bridge.sqlite3")).unwrap();
+        db.execute_batch("CREATE TABLE printers(id TEXT PRIMARY KEY, config TEXT NOT NULL);
+            CREATE TABLE jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,device_id TEXT NOT NULL,printer_id TEXT NOT NULL,queue TEXT NOT NULL,copies INTEGER NOT NULL,sides TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,file TEXT NOT NULL,digest TEXT NOT NULL);
+            INSERT INTO printers VALUES('office','{\"id\":\"office\",\"name\":\"Office\",\"queue\":\"Queue A\",\"enabled\":true,\"duplex\":false,\"max_copies\":99}');
+            INSERT INTO jobs VALUES(1,'old-device','office','Queue A',1,'one-sided','submitted','',1,1,'old.pdf','old-digest');").unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let bridge = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+            let printer = bridge.printer("office").unwrap();
+            assert_eq!(printer.paper_sizes, vec![PaperSize::A4]);
+            assert_eq!(printer.default_paper, PaperSize::A4);
+            assert_eq!(bridge.job(1).unwrap().paper, PaperSize::A4);
+            assert_eq!(bridge.job(1).unwrap().state, "submitted");
+        }
+    }
+
+    #[test]
+    fn paper_configuration_is_validated_and_jobs_preserve_selected_size() {
+        let (directory, bridge, device) = fixture();
+        let mut printer = bridge.printer("office").unwrap();
+        for sizes in [
+            vec![],
+            vec![PaperSize::Letter],
+            vec![PaperSize::A4, PaperSize::A4],
+        ] {
+            printer.paper_sizes = sizes;
+            assert!(bridge.save_printer(printer.clone()).is_err());
+        }
+        printer.paper_sizes = vec![PaperSize::A4, PaperSize::Letter];
+        printer.default_paper = PaperSize::Letter;
+        bridge.save_printer(printer.clone()).unwrap();
+        assert!(bridge
+            .accept(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A3,
+                &pdf_bytes()
+            )
+            .is_err());
+        let job = bridge
+            .accept(
+                &device.device.id,
+                "office",
+                2,
+                "two-sided-short-edge",
+                PaperSize::Letter,
+                &pdf_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            bridge
+                .device_jobs(&device.device.id, "office", "all", 20)
+                .unwrap()[0]
+                .paper,
+            PaperSize::Letter
+        );
+        drop(bridge);
+        let bridge = Bridge::open(directory.path(), true, PathBuf::new()).unwrap();
+        assert_eq!(bridge.job(job.id).unwrap().paper, PaperSize::Letter);
+        assert_eq!(bridge.job(job.id).unwrap().copies, 2);
+        assert_eq!(bridge.job(job.id).unwrap().sides, "two-sided-short-edge");
+        assert_eq!(
+            bridge.printer("office").unwrap().default_paper,
+            PaperSize::Letter
+        );
+        bridge.running.store(true, Ordering::SeqCst);
+        printer.paper_sizes = vec![PaperSize::A4];
+        printer.default_paper = PaperSize::A4;
+        bridge.save_printer(printer).unwrap();
+        assert!(!bridge.process_next().unwrap());
+        assert_eq!(bridge.job(job.id).unwrap().state, "failed");
+    }
+
     fn submit(bridge: &Bridge, device: &CreatedDevice) -> Job {
         bridge
-            .accept(&device.device.id, "office", 1, "one-sided", &pdf_bytes())
+            .accept(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                &pdf_bytes(),
+            )
             .unwrap()
     }
 
@@ -934,7 +1067,14 @@ pub(crate) mod tests {
         assert_eq!(retained, 0);
         assert!(!bridge.authenticate(&device.device.id, &device.token));
         assert!(bridge
-            .accept(&device.device.id, "office", 1, "one-sided", &pdf_bytes())
+            .accept(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                &pdf_bytes()
+            )
             .is_err());
         assert_eq!(bridge.list_jobs().unwrap().len(), 1);
         assert_eq!(bridge.job(job.id).unwrap().state, "pending");
@@ -945,10 +1085,24 @@ pub(crate) mod tests {
         let (_directory, bridge, device) = fixture();
         let pdf = pdf_bytes();
         let first = bridge
-            .accept(&device.device.id, "office", 1, "one-sided", &pdf)
+            .accept(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                &pdf,
+            )
             .unwrap();
         let second = bridge
-            .accept(&device.device.id, "office", 1, "one-sided", &pdf)
+            .accept(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                &pdf,
+            )
             .unwrap();
         assert_ne!(first.id, second.id);
         assert_ne!(
@@ -995,7 +1149,14 @@ pub(crate) mod tests {
         bridge.stop().unwrap();
         assert!(!bridge.process_next().unwrap());
         assert!(bridge
-            .accept(&device.device.id, "office", 1, "one-sided", &pdf_bytes())
+            .accept(
+                &device.device.id,
+                "office",
+                1,
+                "one-sided",
+                PaperSize::A4,
+                &pdf_bytes()
+            )
             .is_err());
         assert_eq!(bridge.job(job.id).unwrap().state, "pending");
     }

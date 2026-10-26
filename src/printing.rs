@@ -1,3 +1,4 @@
+use crate::media::PaperSize;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::Path;
@@ -16,6 +17,8 @@ pub struct PrinterInfo {
 pub struct PrintOptions {
     pub copies: u32,
     pub duplex: String,
+    #[serde(default)]
+    pub paper: PaperSize,
 }
 
 impl Default for PrintOptions {
@@ -23,6 +26,7 @@ impl Default for PrintOptions {
         Self {
             copies: 1,
             duplex: "one-sided".into(),
+            paper: PaperSize::A4,
         }
     }
 }
@@ -58,7 +62,12 @@ pub fn build_print_args(
         "-print-to".into(),
         queue.into(),
         "-print-settings".into(),
-        format!("paper=A4,fit,{}x,{sides}", options.copies).into(),
+        format!(
+            "paperkind={},fit,{}x,{sides}",
+            options.paper.windows_paper_kind(),
+            options.copies
+        )
+        .into(),
         "-silent".into(),
         pdf.as_os_str().to_owned(),
     ])
@@ -197,28 +206,39 @@ mod tests {
 
     #[test]
     fn print_settings_map_all_sides_and_preserve_argument_boundaries() {
-        for (input, expected) in [
-            ("one-sided", "simplex"),
-            ("two-sided-long-edge", "duplexlong"),
-            ("two-sided-short-edge", "duplexshort"),
+        for (paper, paper_kind) in [
+            (PaperSize::A3, 8),
+            (PaperSize::A4, 9),
+            (PaperSize::A5, 11),
+            (PaperSize::A6, 70),
+            (PaperSize::Letter, 1),
+            (PaperSize::Legal, 5),
+            (PaperSize::Tabloid, 3),
         ] {
-            let args = build_print_args(
-                "Office & Warehouse Printer",
-                &pdf(),
-                &PrintOptions {
-                    copies: 3,
-                    duplex: input.into(),
-                },
-            )
-            .unwrap();
-            assert_eq!(args.len(), 6);
-            assert_eq!(args[1], "Office & Warehouse Printer");
-            assert_eq!(
-                args[3],
-                OsString::from(format!("paper=A4,fit,3x,{expected}"))
-            );
-            assert_eq!(args[5], pdf().as_os_str());
-            assert!(!args.iter().any(|arg| arg == "-print-to-default"));
+            for (input, expected) in [
+                ("one-sided", "simplex"),
+                ("two-sided-long-edge", "duplexlong"),
+                ("two-sided-short-edge", "duplexshort"),
+            ] {
+                let args = build_print_args(
+                    "Office & Warehouse Printer",
+                    &pdf(),
+                    &PrintOptions {
+                        copies: 3,
+                        duplex: input.into(),
+                        paper,
+                    },
+                )
+                .unwrap();
+                assert_eq!(args.len(), 6);
+                assert_eq!(args[1], "Office & Warehouse Printer");
+                assert_eq!(
+                    args[3],
+                    OsString::from(format!("paperkind={paper_kind},fit,3x,{expected}"))
+                );
+                assert_eq!(args[5], pdf().as_os_str());
+                assert!(!args.iter().any(|arg| arg == "-print-to-default"));
+            }
         }
     }
 
@@ -240,7 +260,8 @@ mod tests {
             &pdf(),
             &PrintOptions {
                 copies: 1,
-                duplex: "simplex,2x".into()
+                duplex: "simplex,2x".into(),
+                paper: PaperSize::A4,
             }
         )
         .is_err());

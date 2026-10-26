@@ -16,7 +16,7 @@ test('IPP addresses do not contain credentials and encode bridge identifiers', (
 test('macOS setup fields split host, protocol and queue without duplicating the scheme', () => {
   assert.equal(printerSetup('', 'office'), null);
   assert.deepEqual(printerSetup('192.168.8.159:8631', 'front desk'), {
-    address: '192.168.8.159:8631', protocol: 'Internet Printing Protocol - IPP', queue: 'ipp/printers/front%20desk',
+    address: '192.168.8.159:8631', protocol: 'Internet Printing Protocol - IPP', queue: 'ipp/printers/front%20desk', ppd: 'http://192.168.8.159:8631/ipp/printers/front%20desk/driver.ppd',
   });
 });
 test('authentication notice distinguishes pending configuration from the running policy', () => {
@@ -26,8 +26,9 @@ test('authentication notice distinguishes pending configuration from the running
   assert.match(authenticationNotice({ running: true, active_authentication_required: true }), /要求设备认证/);
 });
 test('unchecked capability does not become enabled through a string cast', () => {
-  const form = new Map([['id', ' office '], ['name', ' Office '], ['queue', 'Exact Queue'], ['max_copies', '2'], ['enabled', 'on']]);
-  assert.deepEqual(printerFromForm(form), { id: 'office', name: 'Office', queue: 'Exact Queue', max_copies: 2, enabled: true, duplex: false });
+  const form = new FormData();
+  for (const [key, value] of [['id', ' office '], ['name', ' Office '], ['queue', 'Exact Queue'], ['max_copies', '2'], ['enabled', 'on'], ['paper_sizes', 'A4'], ['default_paper', 'A4']]) form.append(key, value);
+  assert.deepEqual(printerFromForm(form), { id: 'office', name: 'Office', queue: 'Exact Queue', max_copies: 2, enabled: true, duplex: false, paper_sizes: ['A4'], default_paper: 'A4' });
 });
 test('submitted state never claims physical completion', () => {
   assert.equal(stateLabel('submitted'), '已提交');
@@ -38,4 +39,16 @@ test('connection diagnostics distinguish capability probes, accepted jobs and IP
   assert.deepEqual(connectionResult({ http_status: 200, ipp_status: 0, operation: 2 }), { failed: false, label: '任务已接收' });
   assert.deepEqual(connectionResult({ http_status: 200, ipp_status: 0x040b, operation: 2 }), { failed: true, label: '请求被拒绝' });
   assert.deepEqual(connectionResult({ http_status: 401, ipp_status: null, operation: null }), { failed: true, label: '请求被拒绝' });
+});
+
+test('printer form preserves multiple paper sizes and default selection', () => {
+  const form = new FormData();
+  form.append('paper_sizes', 'A4');
+  form.append('paper_sizes', 'Letter');
+  form.append('default_paper', 'Letter');
+  form.append('duplex', 'on');
+  const printer = printerFromForm(form);
+  assert.deepEqual(printer.paper_sizes, ['A4', 'Letter']);
+  assert.equal(printer.default_paper, 'Letter');
+  assert.equal(printer.duplex, true);
 });

@@ -28,11 +28,21 @@
       <label>显示名称<input name="name" required maxlength="120" placeholder="办公室打印机"></label>
       <label>Windows 队列<select name="queue" id="queue" required><option value="">请选择本机队列</option></select></label>
       <label>最大份数<input name="max_copies" type="number" min="1" max="99" value="99" required></label>
+      <fieldset class="paper-options"><legend>已验证支持的纸张</legend><div class="checks">
+        <label><input name="paper_sizes" type="checkbox" value="A3">A3</label>
+        <label><input name="paper_sizes" type="checkbox" value="A4" checked>A4</label>
+        <label><input name="paper_sizes" type="checkbox" value="A5">A5</label>
+        <label><input name="paper_sizes" type="checkbox" value="A6">A6</label>
+        <label><input name="paper_sizes" type="checkbox" value="Letter">Letter</label>
+        <label><input name="paper_sizes" type="checkbox" value="Legal">Legal</label>
+        <label><input name="paper_sizes" type="checkbox" value="Tabloid">Tabloid</label>
+      </div></fieldset>
+      <label>默认纸张<select name="default_paper" required><option>A3</option><option selected>A4</option><option>A5</option><option>A6</option><option>Letter</option><option>Legal</option><option>Tabloid</option></select></label>
       <div class="checks"><label><input name="duplex" type="checkbox">已验证支持双面</label><label><input name="enabled" type="checkbox" checked>启用共享</label></div>
       <div class="form-actions"><button type="submit" class="primary">保存打印机</button><button type="button" id="reset-printer">清空表单</button></div>
     </form>
     <div id="printer-list" class="list"></div>
-    <details class="guide"><summary>macOS 添加步骤</summary><ol><li>启动服务，Windows 防火墙放行对应端口，仅限可信私有网络。</li><li>打开“系统设置 → 打印机与扫描仪 → 添加 → IP”。将每台打印机的 Address、Protocol、Queue 分别填入对应位置。</li><li>Name 可填写共享打印机的显示名称。若 Use 自动选中 PostScript，请选 Other 并使用 Print Bridge PDF PPD。</li><li>开启认证时，用户名填设备 ID，密码填令牌；关闭认证时无需填写。</li></ol><p>当前纸张为 A4。已提交表示交给 Windows，不代表已经出纸。</p></details>
+    <details class="guide"><summary>macOS 添加步骤</summary><ol><li>启动服务，Windows 防火墙放行对应端口，仅限可信私有网络。</li><li>打开“系统设置 → 打印机与扫描仪 → 添加 → IP”。将每台打印机的 Address、Protocol、Queue 分别填入对应位置。</li><li>Name 可填写共享打印机的显示名称。在 Mac 浏览器打开该队列的 PPD 下载地址并保存文件。Use 选择 Other，再选择下载的 Print Bridge PDF PPD。</li><li>开启认证时，用户名填设备 ID，密码填令牌；关闭认证时无需填写。</li></ol><p>纸张和双面选项以每台打印机的已验证配置为准；修改能力后需下载新 PPD 并更新 Mac 队列。已提交表示交给 Windows，不代表已经出纸。</p></details>
   </section>
   <section id="jobs" class="panel" hidden>
     <div class="section-heading"><div><h2>打印任务 <span id="job-count" class="count">0</span></h2><p class="muted">打开此页时每 2 秒自动刷新。“已提交”表示已交给 Windows。</p></div><div class="inline"><label class="sr-only" for="filter">筛选打印机</label><select id="filter"><option value="">全部打印机</option></select><button id="refresh-jobs">刷新</button></div></div>

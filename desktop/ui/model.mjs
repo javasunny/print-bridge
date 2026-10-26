@@ -14,7 +14,7 @@ export function printerUrl(address, id) {
 }
 export function printerSetup(address, id) {
   if (!address) return null;
-  return { address, protocol: 'Internet Printing Protocol - IPP', queue: `ipp/printers/${encodeURIComponent(id)}` };
+  return { address, protocol: 'Internet Printing Protocol - IPP', queue: `ipp/printers/${encodeURIComponent(id)}`, ppd: `http://${address}/ipp/printers/${encodeURIComponent(id)}/driver.ppd` };
 }
 export function authenticationNotice(service) {
   if (service.authentication_restart_required) return '设置已保存，请重启服务后生效。';
@@ -26,5 +26,6 @@ export function printerFromForm(form) {
     id: String(form.get('id') || '').trim(), name: String(form.get('name') || '').trim(),
     queue: String(form.get('queue') || ''), enabled: form.get('enabled') === 'on',
     duplex: form.get('duplex') === 'on', max_copies: Number(form.get('max_copies')),
+    paper_sizes: form.getAll('paper_sizes'), default_paper: String(form.get('default_paper') || 'A4'),
   };
 }

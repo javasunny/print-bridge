@@ -39,9 +39,20 @@ fn assert_pdf_output(ppd: &Path) {
 }
 
 #[test]
-fn bundled_single_sided_ppd_outputs_valid_pdf() {
-    let ppd =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("macos/Print-Bridge-PDF-A4-Simplex.ppd");
+fn bundled_ppd_has_generic_identity_and_outputs_valid_pdf() {
+    let ppd = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("macos/Print-Bridge-PDF.ppd");
+    let content = fs::read_to_string(&ppd).unwrap();
+    for identity in [
+        "*ModelName: \"Print Bridge PDF\"",
+        "*Product: \"(Print Bridge PDF)\"",
+        "*ShortNickName: \"Print Bridge PDF\"",
+        "*NickName: \"Print Bridge PDF\"",
+    ] {
+        assert!(content.lines().any(|line| line == identity), "{identity}");
+    }
+    assert!(content.contains("*DefaultPageSize: A4"));
+    assert_eq!(content.matches("*PageSize ").count(), 1);
+    assert!(!content.contains("*OpenUI *Duplex"));
     assert_pdf_output(&ppd);
 }
 
@@ -73,8 +84,7 @@ fn native_macos_queue_prints_pdf_without_authentication_in_simulation() {
         "ipp://{}/ipp/printers/office",
         bridge.status().address.unwrap()
     );
-    let ppd =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("macos/Print-Bridge-PDF-A4-Simplex.ppd");
+    let ppd = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("macos/Print-Bridge-PDF.ppd");
     let queue = TemporaryQueue(format!(
         "PrintBridge_Compatibility_Test_{}",
         std::process::id()

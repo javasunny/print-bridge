@@ -15,11 +15,11 @@
 *APURFVersion: 1.1
 *cupsLanguages: "en"
 *PCFileName: "APPRINTB.PPD"
-*ModelName: "Print Bridge PDF A4 Single-Sided"
-*Product: "(Print Bridge PDF A4 Single-Sided)"
-*ShortNickName: "Print Bridge PDF A4"
+*ModelName: "Print Bridge PDF"
+*Product: "(Print Bridge PDF)"
+*ShortNickName: "Print Bridge PDF"
 *Manufacturer: "Print Bridge"
-*NickName: "Print Bridge PDF A4 Single-Sided"
+*NickName: "Print Bridge PDF"
 *cupsSingleFile: True
 *cupsFilter2: "application/vnd.cups-pdf application/pdf 0 maxsize(0) -"
 *cupsFilter: "application/vnd.cups-pdf 0 -"

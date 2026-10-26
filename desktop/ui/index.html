@@ -32,7 +32,7 @@
       <div class="form-actions"><button type="submit" class="primary">保存打印机</button><button type="button" id="reset-printer">清空表单</button></div>
     </form>
     <div id="printer-list" class="list"></div>
-    <details class="guide"><summary>macOS 添加步骤</summary><ol><li>启动服务，Windows 防火墙放行对应端口，仅限可信私有网络。</li><li>打开“系统设置 → 打印机与扫描仪 → 添加 → IP”。将每台打印机的 Address、Protocol、Queue 分别填入对应位置。</li><li>Name 可填写共享打印机的显示名称。若 Use 自动选中 PostScript，请选 Other 并使用 Print Bridge PDF A4 PPD。</li><li>开启认证时，用户名填设备 ID，密码填令牌；关闭认证时无需填写。</li></ol><p>当前纸张为 A4。已提交表示交给 Windows，不代表已经出纸。</p></details>
+    <details class="guide"><summary>macOS 添加步骤</summary><ol><li>启动服务，Windows 防火墙放行对应端口，仅限可信私有网络。</li><li>打开“系统设置 → 打印机与扫描仪 → 添加 → IP”。将每台打印机的 Address、Protocol、Queue 分别填入对应位置。</li><li>Name 可填写共享打印机的显示名称。若 Use 自动选中 PostScript，请选 Other 并使用 Print Bridge PDF PPD。</li><li>开启认证时，用户名填设备 ID，密码填令牌；关闭认证时无需填写。</li></ol><p>当前纸张为 A4。已提交表示交给 Windows，不代表已经出纸。</p></details>
   </section>
   <section id="jobs" class="panel" hidden>
     <div class="section-heading"><div><h2>打印任务 <span id="job-count" class="count">0</span></h2><p class="muted">打开此页时每 2 秒自动刷新。“已提交”表示已交给 Windows。</p></div><div class="inline"><label class="sr-only" for="filter">筛选打印机</label><select id="filter"><option value="">全部打印机</option></select><button id="refresh-jobs">刷新</button></div></div>

@@ -14,7 +14,7 @@ cargo run --manifest-path desktop/Cargo.toml --locked
 
 免认证测试：在“设置”取消勾选“要求设备认证”后自动保存。运行中修改会提醒重启服务，当前服务继续使用原认证策略。Mac 无需设备 ID 或令牌；所有免认证任务共用匿名身份。恢复认证同样勾选后重启服务。撤销设备会立即删除其凭据，不保留已撤销条目，历史任务仍保留。
 
-每台共享打印机分别显示并提供复制按钮：Address、Protocol、Queue。macOS 添加时，在“打印机与扫描仪 → 添加打印机 → IP”填写：Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。若 Auto Select 仍选 Generic PostScript Printer，在 Use 选择 Other，打开仓库内的 [Print-Bridge-PDF-A4-Simplex.ppd](../macos/Print-Bridge-PDF-A4-Simplex.ppd)，确认显示 `Print Bridge PDF A4 Single-Sided` 后添加。此配置用于 A4 单面队列，不提供双面选项；不含地址或凭据。认证开启时，打印任务使用设备 ID 和令牌。
+每台共享打印机分别显示并提供复制按钮：Address、Protocol、Queue。macOS 添加时，在“打印机与扫描仪 → 添加打印机 → IP”填写：Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。若 Auto Select 仍选 Generic PostScript Printer，在 Use 选择 Other，打开仓库内的 [Print-Bridge-PDF.ppd](../macos/Print-Bridge-PDF.ppd)，确认显示 `Print Bridge PDF` 后添加。驱动名称不包含纸张或单双面模式；当前配置仍仅提供 A4 单面，不含地址或凭据。已有 macOS 队列会保留安装时的 PPD，需重新选择新 PPD 或重新添加队列才能更新显示；Name 是可自行修改的打印机名称。认证开启时，打印任务使用设备 ID 和令牌。
 
 关闭窗口隐藏到系统托盘；在托盘选择“打开 Print Bridge”可恢复窗口。“停止服务并退出”先停止接收和领取任务，若仍有打印调用则拒绝退出并提示稍后重试，不强行终止打印。
 

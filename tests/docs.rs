@@ -124,6 +124,17 @@ fn release_version_matches_manifests_readme_and_changelog() {
 }
 
 #[test]
+fn release_guidance_does_not_default_to_pre_release_for_early_versions() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for path in ["agents.md", "docs/RELEASING.md"] {
+        let text = fs::read_to_string(root.join(path)).unwrap();
+        assert!(text.contains("默认按正式版本发布"), "{path}");
+        assert!(text.contains("用户明确要求试用版、测试版"), "{path}");
+        assert!(!text.contains("早期版本标记为 pre-release"), "{path}");
+    }
+}
+
+#[test]
 fn license_material_is_present_in_the_installer_resources() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let config: serde_json::Value =

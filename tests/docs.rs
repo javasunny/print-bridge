@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf};
 fn documents() -> Vec<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut paths = vec![
+        root.join("agents.md"),
         root.join("README.md"),
         root.join("desktop/README.md"),
         root.join("CONTRIBUTING.md"),

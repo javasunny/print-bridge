@@ -26,7 +26,7 @@ A local IPP print bridge for Windows, with experimental AirPrint discovery for A
 
 | 文件 | 用途 |
 |---|---|
-| `Print-Bridge_0.1.7_x64-setup.exe` | 推荐：Windows x64 安装包，按需安装 WebView2 |
+| `Print-Bridge_0.2.0_x64-setup.exe` | 推荐：Windows x64 安装包，按需安装 WebView2 |
 | `Print-Bridge-Windows-x64.exe` | 独立程序，需要系统已有 Microsoft Edge WebView2 Runtime |
 | `SHA256SUMS.txt` | 发布文件的 SHA-256 校验值 |
 | `LICENSE`、`THIRD_PARTY_LICENSES.txt` | 项目及第三方依赖许可证，安装包也包含这些文件 |
@@ -36,7 +36,7 @@ A local IPP print bridge for Windows, with experimental AirPrint discovery for A
 安装包尚未进行代码签名，Windows 可能显示 SmartScreen 或发布者提示。仅从本仓库 Release 下载，并可在 PowerShell 中核对摘要：
 
 ```powershell
-Get-FileHash .\Print-Bridge_0.1.7_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\Print-Bridge_0.2.0_x64-setup.exe -Algorithm SHA256
 ```
 
 首次下载打印组件和安装缺失的 WebView2 需要联网。完成准备后，打印通过局域网进行，不依赖云端打印服务。

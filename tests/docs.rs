@@ -93,15 +93,34 @@ fn release_version_matches_manifests_readme_and_changelog() {
             .unwrap();
     let version = config["version"].as_str().unwrap();
     let manifest = fs::read_to_string(root.join("desktop/Cargo.toml")).unwrap();
-    assert!(manifest.contains(&format!("version = \"{version}\"")));
+    let package = manifest
+        .split_once("[package]\n")
+        .unwrap()
+        .1
+        .split("\n[")
+        .next()
+        .unwrap();
+    assert!(package
+        .lines()
+        .any(|line| line == format!("version = \"{version}\"")));
     let lock = fs::read_to_string(root.join("desktop/Cargo.lock")).unwrap();
     assert!(lock.contains(&format!(
         "name = \"print-bridge-desktop\"\nversion = \"{version}\""
     )));
     let readme = fs::read_to_string(root.join("README.md")).unwrap();
     assert!(readme.contains(&format!("Print-Bridge_{version}_x64-setup.exe")));
+    for download in readme.split("Print-Bridge_").skip(1) {
+        assert!(download.starts_with(&format!("{version}_x64-setup.exe")));
+    }
     let changelog = fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
-    assert!(changelog.contains(&format!("## {version} —")));
+    let latest = changelog
+        .lines()
+        .find(|line| {
+            line.strip_prefix("## ")
+                .is_some_and(|heading| heading.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .unwrap();
+    assert!(latest.starts_with(&format!("## {version} —")));
 }
 
 #[test]

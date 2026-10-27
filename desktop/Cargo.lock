@@ -2754,7 +2754,7 @@ dependencies = [
 
 [[package]]
 name = "print-bridge-desktop"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "print-bridge",
  "serde",

@@ -1,0 +1,25 @@
+{
+  "scanned": "2026-10-27",
+  "findings": {
+    "target": "desktop/ui/index.html, five app panels",
+    "fonts": "Microsoft YaHei UI/PingFang SC body, Georgia wordmark, Consolas code (original style.css:1-7)",
+    "palette": "#244c3d named green, #f3f1e9 paper (original style.css:1)",
+    "framework": "Tauri static HTML/CSS/JS (desktop/README.md:3)",
+    "design_spec": "none at preflight"
+  },
+  "preserve": [
+    "five tabs",
+    "all fields and commands",
+    "wordmark",
+    "green accent"
+  ],
+  "introduce": [
+    "printer workspace composition",
+    "semantic tokens",
+    "accessible tabs",
+    "confirmation and busy feedback"
+  ],
+  "mode": "redesign",
+  "depth": "full",
+  "scope": "app"
+}

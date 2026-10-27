@@ -1,0 +1,50 @@
+[
+ {
+  "mode": "redesign",
+  "depth": "full",
+  "scope": "app",
+  "shape": "app screen",
+  "theme": "brand",
+  "axes": "light/grotesk-sans/cool",
+  "nav": "five task tabs",
+  "footer": "local operation facts",
+  "imagery": "none",
+  "photos": [],
+  "entry": "desktop/ui/index.html",
+  "fingerprint": {
+   "shell": "top bar and horizontal tabs",
+   "lead": "service controls",
+   "primary": "printer connection workspace"
+  },
+  "sections": [
+   "service controls",
+   "printers",
+   "jobs",
+   "devices",
+   "settings",
+   "connections"
+  ],
+  "signature": "shared printer connection fields beside configuration",
+  "waived": [],
+  "prompt": "Manage Windows shared printers, Apple client jobs, credentials and connection diagnostics",
+  "date": "2026-10-27",
+  "verification": {
+   "floor_fails": 0,
+   "open_reflex": 0,
+   "warns": 0,
+   "answered": [
+    "F25: desktop minimum window width and keyboard-accessible table scrolling"
+   ],
+   "review": "subagent, ship, 0 findings",
+   "tests": {
+    "frontend_passed": 16,
+    "rust_passed": 101,
+    "existing_ignored": 5
+   },
+   "desktop_check": "passed",
+   "format": "passed",
+   "browser_interactions": "passed with isolated sample backend",
+   "preservation": "All original IDs and input/select attributes retained. Count and badge text moved beside headings."
+  }
+ }
+]

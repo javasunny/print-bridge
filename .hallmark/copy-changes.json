@@ -1,0 +1,32 @@
+[
+  {
+    "before": "LOCAL PRINT",
+    "after": "本地打印",
+    "gate": "67"
+  },
+  {
+    "before": "WINDOWS → APPLE DEVICES；管理共享队列，查看来自 Mac、iPhone 和 iPad 的任务与连接。",
+    "after": "通过 Windows 共享本机打印机，管理来自 Mac、iPhone 和 iPad 的任务与连接。",
+    "gate": "54,67"
+  },
+  {
+    "before": "本地运行 · 无云服务 · 仅 IPP",
+    "after": "本地运行 / 无云服务 / 仅 IPP（独立文本元素）",
+    "gate": "63"
+  },
+  {
+    "before": "打印机详情中的中点串联",
+    "after": "分号串联，原有队列、纸张、默认纸张、双面与份数信息均保留",
+    "gate": "63"
+  },
+  {
+    "before": "Address · 地址 / Protocol · 协议 / Queue · 队列 / PPD · 在 Mac 下载驱动",
+    "after": "移除标签中的中点，字段及复制值不变",
+    "gate": "63"
+  },
+  {
+    "before": "标题内的数量和权限徽章",
+    "after": "移到相邻元素，标题文字和状态值均保留",
+    "gate": "38iii"
+  }
+]

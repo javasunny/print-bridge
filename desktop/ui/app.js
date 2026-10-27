@@ -22,16 +22,37 @@ function message(text, error = false) {
   $('message').className = error ? 'error' : '';
   $('message').hidden = false;
 }
-async function action(work) {
+async function action(work, control) {
   if (busy) return;
   busy = true;
+  if (control) {
+    control.setAttribute('aria-busy', 'true');
+    $('operation-state').hidden = false;
+  }
   try { await work(); } catch (error) { message(String(error), true); }
-  finally { busy = false; }
+  finally {
+    busy = false;
+    if (control) {
+      control.removeAttribute('aria-busy');
+      $('operation-state').hidden = true;
+    }
+  }
+}
+function confirmAction(title, description, label) {
+  const dialog = $('confirm-dialog');
+  $('confirm-title').textContent = title;
+  $('confirm-description').textContent = description;
+  $('confirm-submit').textContent = label;
+  dialog.returnValue = '';
+  return new Promise((resolve) => {
+    dialog.addEventListener('close', () => resolve(dialog.returnValue === 'confirm'), { once: true });
+    dialog.showModal();
+  });
 }
 function button(text, handler, className = '') {
   const el = node('button', text, className);
   el.type = 'button';
-  el.addEventListener('click', () => action(handler));
+  el.addEventListener('click', () => action(handler, el));
   return el;
 }
 function empty(list, text) { list.replaceChildren(node('div', text, 'empty')); }
@@ -84,13 +105,13 @@ function renderPrinters() {
   for (const printer of printers) {
     const card = node('article', undefined, 'printer-card');
     const title = node('div', undefined, 'printer-title');
-    const heading = node('h3', printer.name); heading.append(badge(printer.enabled ? '已启用' : '已停用'));
-    title.append(heading, button('编辑', async () => editPrinter(printer), 'small-button'));
-    card.append(title, node('p', `${printer.queue} · ${printer.paper_sizes.join(' / ')}（默认 ${printer.default_paper}） · ${printer.duplex ? '支持双面' : '仅单面'} · 最多 ${printer.max_copies} 份`, 'muted'));
+    const heading = node('h3', printer.name);
+    title.append(heading, badge(printer.enabled ? '已启用' : '已停用'), button('编辑', async () => editPrinter(printer), 'small-button'));
+    card.append(title, node('p', `${printer.queue}；${printer.paper_sizes.join(' / ')}（默认 ${printer.default_paper}）；${printer.duplex ? '支持双面' : '仅单面'}；最多 ${printer.max_copies} 份`, 'muted'));
     const setup = printerSetup(service.address || $('address').value.trim(), printer.id);
     if (setup) {
       const fields = node('div', undefined, 'setup-fields');
-      for (const [key, label] of [['address', 'Address · 地址'], ['protocol', 'Protocol · 协议'], ['queue', 'Queue · 队列'], ['ppd', 'PPD · 在 Mac 下载驱动']]) {
+      for (const [key, label] of [['address', 'Address 地址'], ['protocol', 'Protocol 协议'], ['queue', 'Queue 队列'], ['ppd', 'PPD 在 Mac 下载驱动']]) {
         const field = node('div', undefined, 'setup-field');
         const value = node('div', undefined, 'copy-field');
         value.append(node('code', setup[key]), button('复制', async () => {
@@ -166,51 +187,69 @@ async function refreshDevices() {
   const list = $('device-list'); list.replaceChildren();
   for (const device of devices) {
     const row = node('article', undefined, 'list-card');
-    const body = node('div'); const heading = node('h3', device.name); heading.append(badge('可打印'));
+    const body = node('div'); const heading = node('div', undefined, 'device-heading');
+    heading.append(node('h3', device.name), badge('可打印'));
     body.append(heading, node('code', `用户名：${device.id}`));
     row.append(body, button('撤销并移除', async () => {
+      if (!await confirmAction('撤销设备凭据？', `“${device.name}”的凭据将立即失效并从列表移除，历史打印任务仍保留。`, '撤销并移除')) return;
       await invoke('revoke_device', { id: device.id }); await refreshDevices(); message('设备凭据已撤销并移除。');
-    }, 'small-button'));
+    }, 'small-button danger'));
     list.append(row);
   }
   const auth = service.running ? service.active_authentication_required : service.authentication_required;
   if (!devices.length) empty(list, auth ? '创建设备凭据后，Mac 才能提交任务。' : '认证已关闭，Mac 可以直接提交任务。');
 }
-for (const tab of document.querySelectorAll('[data-tab]')) tab.addEventListener('click', () => {
+function activateTab(tab) {
   for (const item of document.querySelectorAll('[data-tab]')) {
     const active = item === tab; item.classList.toggle('active', active); item.setAttribute('aria-selected', active);
+    item.tabIndex = active ? 0 : -1;
     $(item.dataset.tab).hidden = !active;
   }
+  window.history.replaceState(null, '', `#${tab.dataset.tab}`);
   if (tab.dataset.tab !== 'devices') hideSecret();
-  action(tab.dataset.tab === 'connections' ? refreshConnections : tab.dataset.tab === 'jobs' ? refreshJobs : tab.dataset.tab === 'devices' ? refreshDevices : tab.dataset.tab === 'settings' ? refreshSumatra : refreshPrinters);
-});
+  return action(tab.dataset.tab === 'connections' ? refreshConnections : tab.dataset.tab === 'jobs' ? refreshJobs : tab.dataset.tab === 'devices' ? refreshDevices : tab.dataset.tab === 'settings' ? refreshSumatra : refreshPrinters, tab);
+}
+const tabs = [...document.querySelectorAll('[data-tab]')];
+for (const tab of tabs) {
+  tab.addEventListener('click', () => activateTab(tab));
+  tab.addEventListener('keydown', (event) => {
+    const index = tabs.indexOf(tab);
+    const next = { ArrowRight: (index + 1) % tabs.length, ArrowLeft: (index + tabs.length - 1) % tabs.length, Home: 0, End: tabs.length - 1 }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    tabs[next].focus();
+    activateTab(tabs[next]);
+  });
+}
 $('printer-form').addEventListener('submit', (event) => { event.preventDefault(); action(async () => {
   await invoke('save_printer', { printer: printerFromForm(new FormData(event.target)) });
   resetPrinter(); await refreshPrinters(); message('打印机配置已保存。');
-}); });
+}, event.submitter); });
 function resetPrinter() { $('printer-form').reset(); $('printer-form').elements.id.readOnly = false; }
 $('reset-printer').addEventListener('click', resetPrinter);
-$('refresh-printers').addEventListener('click', () => action(async () => { await refreshQueues(); await refreshPrinters(); }));
-$('refresh-jobs').addEventListener('click', () => action(refreshJobs));
-$('refresh-connections').addEventListener('click', () => action(refreshConnections));
+$('refresh-printers').addEventListener('click', () => action(async () => { await refreshQueues(); await refreshPrinters(); }, $('refresh-printers')));
+$('refresh-jobs').addEventListener('click', () => action(refreshJobs, $('refresh-jobs')));
+$('refresh-connections').addEventListener('click', () => action(refreshConnections, $('refresh-connections')));
 $('clear-jobs').addEventListener('click', () => action(async () => {
+  if (!await confirmAction('清除全部已结束记录？', '将删除全部打印机的已结束任务及其缓存文档，不受当前筛选影响。等待、处理中和待核查任务将保留，此操作无法撤销。', '清除记录')) return;
   const count = await invoke('clear_job_history');
   await refreshJobs();
   message(`已清除 ${count} 条打印记录。等待、处理中和待核查任务已保留。`);
-}));
+}, $('clear-jobs')));
 $('clear-connections').addEventListener('click', () => action(async () => {
+  if (!await confirmAction('清除连接诊断记录？', '将清空本次运行已记录的连接诊断，后续请求会继续记录。此操作无法撤销。', '清除记录')) return;
   const count = await invoke('clear_connection_events');
   await refreshConnections();
   message(`已清除 ${count} 条诊断记录。后续请求将继续记录。`);
-}));
+}, $('clear-connections')));
 $('filter').addEventListener('change', () => action(refreshJobs));
 $('address').addEventListener('input', renderPrinters);
 $('start').addEventListener('click', () => action(async () => {
   await invoke('start_service', { address: $('address').value.trim() }); await refreshStatus(); renderPrinters(); message('IPP 服务已启动。');
-}));
+}, $('start')));
 $('stop').addEventListener('click', () => action(async () => {
   await invoke('stop_service'); await refreshStatus(); renderPrinters(); message('服务已停止接收新任务，等待任务已保留。');
-}));
+}, $('stop')));
 $('authentication-required').addEventListener('change', async () => {
   if (busy) { $('authentication-required').checked = service.authentication_required; return; }
   $('authentication-required').disabled = true;
@@ -248,20 +287,20 @@ $('check-sumatra-update').addEventListener('click', () => action(async () => {
     componentStatus = await invoke('check_sumatra_update');
     message(componentStatus.update_available ? `发现 SumatraPDF ${componentStatus.latest_version}，可下载更新。` : componentStatus.ready ? 'SumatraPDF 已是最新稳定版。' : `最新稳定版为 ${componentStatus.latest_version}，可下载组件。`);
   } finally { checkingUpdate = false; renderSumatra(); }
-}));
+}, $('check-sumatra-update')));
 $('download-sumatra').addEventListener('click', () => action(async () => {
   if (downloadPending || service.running) return;
   downloadPending = true; renderSumatra();
   try { componentStatus = await invoke('download_sumatra'); message('打印组件已下载并校验，可启动真实打印服务。'); }
   finally { downloadPending = false; await refreshSumatra(); }
-}));
+}, $('download-sumatra')));
 $('dismiss-secret').addEventListener('click', hideSecret);
 $('device-form').addEventListener('submit', (event) => { event.preventDefault(); action(async () => {
   hideSecret();
   const created = await invoke('create_device', { name: new FormData(event.target).get('name').trim() });
   $('secret-id').value = created.device.id; $('secret-token').value = created.token; $('secret').hidden = false;
   event.target.reset(); await refreshDevices();
-}); });
+}, event.submitter); });
 window.addEventListener('pagehide', hideSecret);
 setInterval(() => {
   if (!window.__TAURI__ || document.hidden) return;
@@ -280,5 +319,8 @@ if (window.__TAURI__) action(async () => {
     catch (error) { $('network-note').textContent = `${String(error)}。请手动填写本机局域网 IPv4:8631。`; }
   }
   await refreshPrinters(); await refreshDevices(); await refreshJobs(); await refreshQueues(); await refreshSumatra();
+}).then(() => {
+  const saved = tabs.find((tab) => `#${tab.dataset.tab}` === window.location.hash);
+  if (saved) activateTab(saved);
 });
 else { $('start').disabled = true; message('请从 Windows 桌面应用打开此界面。浏览器预览不连接打印服务。', true); }

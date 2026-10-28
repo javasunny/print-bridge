@@ -10,7 +10,7 @@
 cargo run --manifest-path desktop/Cargo.toml --locked
 ```
 
-首次使用时在“设置”点击“下载打印组件”；从官方网站下载并校验 SumatraPDF 后即可使用。在“共享打印机”选择本机队列并保存；需要认证时创建设备凭据，再启动服务。启动界面自动检测本机局域网 IPv4 并填入 `IP:8631`；可手动修改，检测失败时不会回退到回环地址。
+首次使用时在“设置”点击“下载打印组件”；从官方网站下载并校验 SumatraPDF 后即可使用。在“共享打印机”选择本机队列并保存；需要认证时创建设备凭据，再启动服务。启动界面默认填入 `0.0.0.0:8631`，监听全部 IPv4 网卡，可手动修改；不再等待 IP 检测。已保存的共享队列独立于系统队列枚举加载。
 
 免认证测试：在“设置”取消勾选“要求设备认证”后自动保存。运行中修改会提醒重启服务，当前服务继续使用原认证策略。Mac 无需设备 ID 或令牌；所有免认证任务共用匿名身份。恢复认证同样勾选后重启服务。撤销设备会立即删除其凭据，不保留已撤销条目，历史任务仍保留。
 
@@ -18,7 +18,7 @@ cargo run --manifest-path desktop/Cargo.toml --locked
 
 启动服务后，共享队列通过 Bonjour 发布；在私有网络放行服务 TCP 端口及 UDP 5353。Mac 在“打印机与扫描仪 → 添加”的默认列表选择共享名称，Use 选择 AirPrint，无需下载 PPD。iPhone/iPad 在应用的“打印 → 选择打印机”中选择同名队列。认证开启时仍使用设备 ID 和令牌；首次免认证联机测试可手动关闭认证并重启服务。实验性能力和联机验收说明见 [AirPrint 说明](../docs/airprint.md)。
 
-每台共享打印机仍显示并提供复制按钮：Address、Protocol、Queue、PPD 下载地址，作为手动连接备用。Mac 手动添加时，Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。旧 PDF PPD 仍可从该队列的下载地址（`http://Windows地址:端口/ipp/printers/桥接ID/driver.ppd`）保存，再在 Use → Other 中选择。PPD 仅包含该队列已配置的纸张和双面；下载与 IPP 能力查询一样无需认证。
+填写具体监听 IP 时，每台共享打印机显示并提供复制按钮：Address、Protocol、Queue、PPD 下载地址，作为手动连接备用。使用默认 `0.0.0.0` 监听时，界面提示使用 Windows 的实际局域网 IP。Mac 手动添加时，Address 为 `Windows 局域网 IP:端口`，Protocol 为 IPP，Queue 为 `ipp/printers/桥接 ID`。旧 PDF PPD 仍可从该队列的下载地址（`http://Windows地址:端口/ipp/printers/桥接ID/driver.ppd`）保存，再在 Use → Other 中选择。PPD 仅包含该队列已配置的纸张和双面；下载与 IPP 能力查询一样无需认证。
 
 修改纸张、默认纸张、份数上限或双面能力后，广播会更新；Mac 可能需要重新添加队列。旧 PPD 队列需重新下载并选择 PPD，macOS 会保留安装时的配置。Name 是可自行修改的打印机名称。仓库中的 [Print-Bridge-PDF.ppd](../macos/Print-Bridge-PDF.ppd) 仅作为 A4 单面备用配置，多纸张和双面请使用每台打印机的下载地址。PDF 按所选目标纸张适应可打印区域缩放；Windows 端使用标准纸张编号（paperkind），避免中文或驱动自定义纸张名称影响匹配。
 

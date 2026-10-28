@@ -26,7 +26,7 @@ A local IPP print bridge for Windows, with experimental AirPrint discovery for A
 
 | 文件 | 用途 |
 |---|---|
-| `Print-Bridge_0.2.0_x64-setup.exe` | 推荐：Windows x64 安装包，按需安装 WebView2 |
+| `Print-Bridge_0.2.1_x64-setup.exe` | 推荐：Windows x64 安装包，按需安装 WebView2 |
 | `Print-Bridge-Windows-x64.exe` | 独立程序，需要系统已有 Microsoft Edge WebView2 Runtime |
 | `SHA256SUMS.txt` | 发布文件的 SHA-256 校验值 |
 | `LICENSE`、`THIRD_PARTY_LICENSES.txt` | 项目及第三方依赖许可证，安装包也包含这些文件 |
@@ -36,7 +36,7 @@ A local IPP print bridge for Windows, with experimental AirPrint discovery for A
 安装包尚未进行代码签名，Windows 可能显示 SmartScreen 或发布者提示。仅从本仓库 Release 下载，并可在 PowerShell 中核对摘要：
 
 ```powershell
-Get-FileHash .\Print-Bridge_0.2.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\Print-Bridge_0.2.1_x64-setup.exe -Algorithm SHA256
 ```
 
 首次下载打印组件和安装缺失的 WebView2 需要联网。完成准备后，打印通过局域网进行，不依赖云端打印服务。
@@ -57,7 +57,7 @@ Get-FileHash .\Print-Bridge_0.2.0_x64-setup.exe -Algorithm SHA256
 - **iPhone / iPad**：与 Windows 连接同一局域网，在应用的“打印 → 选择打印机”中选择共享名称。这些设备的完整联机兼容性仍待验收。
 - **认证开启时**：用户名填设备 ID，密码填令牌。不要把凭据写入打印机 URL。
 
-如果自动发现不可用，Mac 可以手动填写 IPP 地址，例如 `ipp://192.168.1.10:8631/ipp/printers/office`。界面提供独立的 Address、Protocol、Queue 和 PPD 下载地址，详见 [桌面使用说明](desktop/README.md)。
+如果自动发现不可用，Mac 可以手动填写 IPP 地址，例如 `ipp://192.168.1.10:8631/ipp/printers/office`。填写具体监听 IP 时，界面提供独立的 Address、Protocol、Queue 和 PPD 下载地址；默认监听全部网卡时，请使用 Windows 的实际局域网 IP，详见 [桌面使用说明](desktop/README.md)。
 
 ### 3. 查看任务与诊断
 

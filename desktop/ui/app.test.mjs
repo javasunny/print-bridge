@@ -23,6 +23,8 @@ class Element {
   close(value) { this.returnValue = value; this.open = false; this.listeners.close(); }
   append(...children) { this.children.push(...children); }
   replaceChildren(...children) { this.children = children; }
+  add(child) { this.append(child); }
+  get options() { return this.children; }
   createTHead() { const head = new Element(); this.append(head); return head; }
   createTBody() { const body = new Element(); this.append(body); return body; }
   insertRow() { const row = new Element(); this.append(row); return row; }
@@ -32,6 +34,7 @@ class Element {
 function app(invoke, { confirmChoice = 'confirm' } = {}) {
   const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   const elements = new Map([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => [id, new Element()]));
+  elements.get('address').value = html.match(/id="address" value="([^"]+)"/)[1];
   const tabs = ['printers', 'jobs', 'devices', 'settings', 'connections'].map((name) => {
     const tab = elements.get(`tab-${name}`);
     tab.dataset.tab = name;
@@ -53,10 +56,13 @@ function app(invoke, { confirmChoice = 'confirm' } = {}) {
       createElement: () => new Element(),
     },
     setInterval() {},
+    Option: class extends Element {
+      constructor(text, value) { super(); this.textContent = text; this.value = value; }
+    },
   });
   const source = readFileSync(new URL('./app.js', import.meta.url), 'utf8');
   vm.runInContext(source.replace(/^import .*?;\n/, ''), context);
-  window.__TAURI__ = { core: { invoke } };
+  window.__TAURI__ = { core: { invoke }, event: { async listen() {} } };
   return { context, get: (id) => elements.get(id) };
 }
 
@@ -83,6 +89,53 @@ test('clear print history refreshes the filtered list and count while keeping pe
   assert.equal(get('filter').value, 'office');
   assert.match(get('message').textContent, /已清除 2 条打印记录/);
   assert.match(get('message').textContent, /待核查任务已保留/);
+});
+
+test('startup shows saved queues and accepts actions while system enumeration is pending', async () => {
+  const commands = [];
+  let finishQueues;
+  const { context, get } = app(async (command) => {
+    commands.push(command);
+    switch (command) {
+      case 'service_status': return { running: false, simulation: false, address: null };
+      case 'list_printers': return [{ id: 'office', name: 'Office', queue: 'USB Office', paper_sizes: ['A4'], default_paper: 'A4', max_copies: 1, enabled: true }];
+      case 'list_devices': case 'list_jobs': return [];
+      case 'available_printers': return new Promise((resolve) => { finishQueues = resolve; });
+      case 'sumatra_status': return { ready: false };
+      default: assert.fail(`Unexpected command: ${command}`);
+    }
+  });
+  assert.equal(get('address').value, '0.0.0.0:8631');
+  const startup = context.initializeApp();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(get('printer-count').textContent, 1);
+  assert.match(get('printer-list').children[0].children[1].textContent, /USB Office/);
+  assert.equal(commands.includes('default_listen_address'), false);
+  let responsive = false;
+  await context.action(async () => { responsive = true; });
+  assert.equal(responsive, true);
+  get('address').value = '192.168.1.5:8631';
+  finishQueues([{ name: 'USB Office' }]);
+  await startup;
+  assert.equal(get('queue').options[1].value, 'USB Office');
+  assert.equal(get('address').value, '192.168.1.5:8631');
+});
+
+test('system enumeration failure leaves saved queues visible and preserves an active address', async () => {
+  const { context, get } = app(async (command) => {
+    switch (command) {
+      case 'service_status': return { running: true, address: '192.168.1.8:8631' };
+      case 'list_printers': return [{ id: 'office', name: 'Office', queue: 'Office', paper_sizes: ['A4'], default_paper: 'A4', max_copies: 1 }];
+      case 'list_devices': case 'list_jobs': return [];
+      case 'available_printers': throw new Error('枚举失败');
+      case 'sumatra_status': return { ready: false };
+      default: assert.fail(`Unexpected command: ${command}`);
+    }
+  });
+  await context.initializeApp();
+  assert.equal(get('printer-count').textContent, 1);
+  assert.equal(get('address').value, '192.168.1.8:8631');
+  assert.match(get('message').textContent, /枚举失败/);
 });
 
 test('clear diagnostics renders the empty list and later refreshes show new requests', async () => {

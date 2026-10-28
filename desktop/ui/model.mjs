@@ -18,7 +18,7 @@ export function printerUrl(address, id) {
   return `ipp://${address}/ipp/printers/${encodeURIComponent(id)}`;
 }
 export function printerSetup(address, id) {
-  if (!address) return null;
+  if (!address || /^(0\.0\.0\.0|\[::\]):/.test(address)) return null;
   return { address, protocol: 'Internet Printing Protocol - IPP', queue: `ipp/printers/${encodeURIComponent(id)}`, ppd: `http://${address}/ipp/printers/${encodeURIComponent(id)}/driver.ppd` };
 }
 export function authenticationNotice(service) {

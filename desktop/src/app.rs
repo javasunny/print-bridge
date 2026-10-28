@@ -14,12 +14,6 @@ use tauri::{
 type Backend<'a> = State<'a, Arc<Bridge>>;
 
 #[tauri::command]
-async fn default_listen_address() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(print_bridge::network::default_listen_address)
-        .await
-        .map_err(|_| "无法检测局域网 IPv4 地址".to_string())?
-}
-#[tauri::command]
 fn service_status(bridge: Backend<'_>) -> ServiceStatus {
     bridge.status()
 }
@@ -203,7 +197,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             service_status,
-            default_listen_address,
             list_printers,
             save_printer,
             available_printers,

@@ -120,7 +120,7 @@ function renderPrinters() {
         field.append(node('span', label, 'field-label'), value); fields.append(field);
       }
       card.append(fields);
-    } else card.append(node('p', '填写监听地址后显示 macOS 添加字段。', 'muted'));
+    } else card.append(node('p', `Mac 可通过自动发现添加；手动添加时使用 Windows 的实际局域网 IP 和队列 ipp/printers/${encodeURIComponent(printer.id)}。`, 'muted'));
     list.append(card);
   }
   if (!printers.length) empty(list, '还没有共享打印机。先选择一个 Windows 队列。');
@@ -227,7 +227,7 @@ $('printer-form').addEventListener('submit', (event) => { event.preventDefault()
 }, event.submitter); });
 function resetPrinter() { $('printer-form').reset(); $('printer-form').elements.id.readOnly = false; }
 $('reset-printer').addEventListener('click', resetPrinter);
-$('refresh-printers').addEventListener('click', () => action(async () => { await refreshQueues(); await refreshPrinters(); }, $('refresh-printers')));
+$('refresh-printers').addEventListener('click', () => action(async () => { await Promise.all([refreshQueues(), refreshPrinters()]); }, $('refresh-printers')));
 $('refresh-jobs').addEventListener('click', () => action(refreshJobs, $('refresh-jobs')));
 $('refresh-connections').addEventListener('click', () => action(refreshConnections, $('refresh-connections')));
 $('clear-jobs').addEventListener('click', () => action(async () => {
@@ -310,16 +310,16 @@ setInterval(() => {
     else if (!$('jobs').hidden) await refreshJobs();
   });
 }, 2000);
-if (window.__TAURI__) action(async () => {
+async function initializeApp() {
   await window.__TAURI__.event.listen('hide-secret', hideSecret);
   await window.__TAURI__.event.listen('exit-blocked', async ({ payload }) => { hideSecret(); message(payload, true); await refreshStatus(); });
   await refreshStatus();
-  if (!service.address) {
-    try { $('address').value = await invoke('default_listen_address'); }
-    catch (error) { $('network-note').textContent = `${String(error)}。请手动填写本机局域网 IPv4:8631。`; }
-  }
-  await refreshPrinters(); await refreshDevices(); await refreshJobs(); await refreshQueues(); await refreshSumatra();
-}).then(() => {
+  await Promise.all([
+    async () => { await refreshPrinters(); await refreshJobs(); },
+    refreshDevices, refreshQueues, refreshSumatra,
+  ].map((load) => load().catch((error) => message(String(error), true))));
+}
+if (window.__TAURI__) initializeApp().catch((error) => message(String(error), true)).then(() => {
   const saved = tabs.find((tab) => `#${tab.dataset.tab}` === window.location.hash);
   if (saved) activateTab(saved);
 });

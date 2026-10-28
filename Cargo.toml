@@ -25,6 +25,9 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Printing"] }
+
 [dev-dependencies]
 http-body = "1"
 tower = { version = "0.5", features = ["util"] }

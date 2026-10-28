@@ -15,6 +15,8 @@ test('IPP addresses do not contain credentials and encode bridge identifiers', (
 });
 test('macOS setup fields split host, protocol and queue without duplicating the scheme', () => {
   assert.equal(printerSetup('', 'office'), null);
+  assert.equal(printerSetup('0.0.0.0:8631', 'office'), null);
+  assert.equal(printerSetup('[::]:8631', 'office'), null);
   assert.deepEqual(printerSetup('192.168.8.159:8631', 'front desk'), {
     address: '192.168.8.159:8631', protocol: 'Internet Printing Protocol - IPP', queue: 'ipp/printers/front%20desk', ppd: 'http://192.168.8.159:8631/ipp/printers/front%20desk/driver.ppd',
   });

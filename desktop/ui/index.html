@@ -19,10 +19,10 @@
   <section class="intro"><div><h1>本机打印共享</h1><p class="muted">通过 Windows 共享本机打印机，管理来自 Mac、iPhone 和 iPad 的任务与连接。</p></div></section>
   <div id="message" role="status" aria-live="polite" hidden></div>
   <section class="service-bar" aria-label="IPP 服务">
-    <div class="service-state"><span id="lamp" aria-hidden="true" class="lamp"></span><strong id="service-state">服务未启动</strong><small id="service-address">正在检测局域网地址</small></div>
-    <label>监听地址<input id="address" placeholder="局域网 IPv4:8631" spellcheck="false" aria-describedby="network-note"></label>
+    <div class="service-state"><span id="lamp" aria-hidden="true" class="lamp"></span><strong id="service-state">服务未启动</strong><small id="service-address">仅在可信局域网使用</small></div>
+    <label>监听地址<input id="address" value="0.0.0.0:8631" placeholder="0.0.0.0:8631" spellcheck="false" aria-describedby="network-note"></label>
     <div class="service-actions"><button id="start" class="primary">启动服务</button><button id="stop" disabled>停止服务</button></div>
-    <div class="service-notes"><p id="network-note">启动时自动检测局域网 IPv4，可手动修改。仅在可信私有网络中使用。</p>
+    <div class="service-notes"><p id="network-note">默认监听全部 IPv4 网卡，可手动修改。Mac 手动添加时请使用 Windows 的实际局域网 IP。仅在可信私有网络中使用。</p>
     <p id="discovery-note" role="status">启动服务后可自动发现共享打印机。</p></div>
   </section>
   <p id="operation-state" role="status" aria-live="polite" hidden>正在处理，请稍候…</p>

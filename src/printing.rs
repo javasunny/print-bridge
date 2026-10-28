@@ -88,25 +88,60 @@ pub fn build_print_args(
 
 #[cfg(windows)]
 pub fn enumerate_printers() -> Result<Vec<PrinterInfo>, String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
+    use std::mem::size_of;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER};
+    use windows_sys::Win32::Graphics::Printing::{
+        EnumPrintersW, PRINTER_ENUM_CONNECTIONS, PRINTER_ENUM_LOCAL,
+    };
 
-    // The script is constant: queue names are returned as data, never executed.
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); @(Get-Printer | Select-Object Name,DriverName,PortName) | ConvertTo-Json -Compress",
-        ])
-        .creation_flags(0x08000000)
-        .output()
-        .map_err(|_| "无法运行 Windows 打印机枚举程序".to_owned())?;
-    if !output.status.success() {
-        return Err("Windows 打印机枚举失败，请确认 PrintManagement 可用".into());
+    let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
+    let mut needed = 0u32;
+    let mut returned = 0u32;
+    let success =
+        unsafe { EnumPrintersW(flags, null(), 4, null_mut(), 0, &mut needed, &mut returned) };
+    if success != 0 {
+        return Ok(Vec::new());
     }
-    parse_printers(&output.stdout)
+    let error = unsafe { GetLastError() };
+    if error != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+        return Err(format!("Windows 打印机枚举失败（错误码 {error}）"));
+    }
+
+    loop {
+        let requested_bytes =
+            usize::try_from(needed).map_err(|_| "Windows 打印机列表过大".to_owned())?;
+        let words = requested_bytes
+            .checked_add(size_of::<u64>() - 1)
+            .ok_or_else(|| "Windows 打印机列表过大".to_owned())?
+            / size_of::<u64>();
+        let allocated_bytes = words
+            .checked_mul(size_of::<u64>())
+            .ok_or_else(|| "Windows 打印机列表过大".to_owned())?;
+        let buffer_bytes =
+            u32::try_from(allocated_bytes).map_err(|_| "Windows 打印机列表过大".to_owned())?;
+        let mut buffer = vec![0u64; words];
+
+        let success = unsafe {
+            EnumPrintersW(
+                flags,
+                null(),
+                4,
+                buffer.as_mut_ptr().cast(),
+                buffer_bytes,
+                &mut needed,
+                &mut returned,
+            )
+        };
+        if success != 0 {
+            return parse_printer_info_4(&buffer, allocated_bytes, returned);
+        }
+
+        let error = unsafe { GetLastError() };
+        if error != ERROR_INSUFFICIENT_BUFFER || needed <= buffer_bytes {
+            return Err(format!("Windows 打印机枚举失败（错误码 {error}）"));
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -114,22 +149,61 @@ pub fn enumerate_printers() -> Result<Vec<PrinterInfo>, String> {
     Err("真实打印机枚举仅支持 Windows".into())
 }
 
-#[cfg(any(windows, test))]
-fn parse_printers(bytes: &[u8]) -> Result<Vec<PrinterInfo>, String> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| "打印机枚举结果不是 UTF-8".to_owned())?
-        .trim_start_matches('\u{feff}')
-        .trim();
-    if text.is_empty() || text == "null" {
-        return Ok(Vec::new());
+#[cfg(windows)]
+fn parse_printer_info_4(
+    buffer: &[u64],
+    buffer_bytes: usize,
+    returned: u32,
+) -> Result<Vec<PrinterInfo>, String> {
+    use std::mem::{align_of, size_of};
+    use windows_sys::Win32::Graphics::Printing::PRINTER_INFO_4W;
+
+    let entry_size = size_of::<PRINTER_INFO_4W>();
+    let returned = usize::try_from(returned).map_err(|_| "Windows 打印机列表无效".to_owned())?;
+    if buffer_bytes > std::mem::size_of_val(buffer) || returned > buffer_bytes / entry_size {
+        return Err("Windows 打印机列表无效".into());
     }
-    if text.starts_with('[') {
-        serde_json::from_str(text).map_err(|_| "打印机枚举结果无效".into())
-    } else {
-        serde_json::from_str(text)
-            .map(|printer| vec![printer])
-            .map_err(|_| "打印机枚举结果无效".into())
+
+    let base = buffer.as_ptr().cast::<u8>();
+    let start = base as usize;
+    let end = start
+        .checked_add(buffer_bytes)
+        .ok_or_else(|| "Windows 打印机列表无效".to_owned())?;
+    let entries = base.cast::<PRINTER_INFO_4W>();
+    if (entries as usize) % align_of::<PRINTER_INFO_4W>() != 0 {
+        return Err("Windows 打印机列表未对齐".into());
     }
+
+    let mut printers = Vec::with_capacity(returned);
+    for index in 0..returned {
+        let entry = unsafe { &*entries.add(index) };
+        let name = read_printer_name(entry.pPrinterName, start, end)?;
+        printers.push(PrinterInfo {
+            name,
+            driver_name: String::new(),
+            port_name: String::new(),
+        });
+    }
+    Ok(printers)
+}
+
+#[cfg(windows)]
+fn read_printer_name(pointer: *const u16, start: usize, end: usize) -> Result<String, String> {
+    use std::mem::{align_of, size_of};
+    use std::slice;
+
+    let address = pointer as usize;
+    if pointer.is_null() || address < start || address >= end || address % align_of::<u16>() != 0 {
+        return Err("Windows 打印机名称无效".into());
+    }
+    let remaining_bytes = end - address;
+    let units = remaining_bytes / size_of::<u16>();
+    let wide = unsafe { slice::from_raw_parts(pointer, units) };
+    let terminator = wide
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or_else(|| "Windows 打印机名称未终止".to_owned())?;
+    String::from_utf16(&wide[..terminator]).map_err(|_| "Windows 打印机名称不是有效 UTF-16".into())
 }
 
 #[cfg(windows)]
@@ -313,21 +387,62 @@ mod tests {
         assert_eq!(legacy.color_mode, "auto");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn accepts_empty_single_and_multiple_printer_enumerations() {
-        assert!(parse_printers(b"").unwrap().is_empty());
-        assert!(parse_printers(b"null").unwrap().is_empty());
-        assert!(parse_printers(b"[]").unwrap().is_empty());
-        let one = parse_printers(br#"{"Name":"Office","DriverName":"Driver","PortName":"USB001"}"#)
-            .unwrap();
-        assert_eq!(one[0].name, "Office");
-        assert_eq!(
-            parse_printers(br#"[{"Name":"Office"},{"Name":"Warehouse"}]"#)
-                .unwrap()
-                .len(),
-            2
-        );
-        assert!(parse_printers(b"not json").is_err());
+    fn parses_level_four_printer_names_from_an_aligned_utf16_buffer() {
+        use std::mem::{size_of, size_of_val};
+        use std::ptr::{copy_nonoverlapping, null_mut, write};
+        use windows_sys::Win32::Graphics::Printing::PRINTER_INFO_4W;
+
+        let mut name: Vec<u16> = "办公室 🖨".encode_utf16().collect();
+        name.push(0);
+        let data_bytes = size_of::<PRINTER_INFO_4W>() + name.len() * size_of::<u16>();
+        let mut buffer = vec![0u64; data_bytes.div_ceil(size_of::<u64>())];
+        let base = buffer.as_mut_ptr().cast::<u8>();
+        let name_pointer = unsafe { base.add(size_of::<PRINTER_INFO_4W>()).cast::<u16>() };
+        unsafe {
+            copy_nonoverlapping(name.as_ptr(), name_pointer, name.len());
+            write(
+                base.cast::<PRINTER_INFO_4W>(),
+                PRINTER_INFO_4W {
+                    pPrinterName: name_pointer,
+                    pServerName: null_mut(),
+                    Attributes: 0,
+                },
+            );
+        }
+
+        let printers = parse_printer_info_4(&buffer, size_of_val(buffer.as_slice()), 1).unwrap();
+        assert_eq!(printers.len(), 1);
+        assert_eq!(printers[0].name, "办公室 🖨");
+        assert!(printers[0].driver_name.is_empty());
+        assert!(printers[0].port_name.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_unterminated_level_four_printer_name() {
+        use std::mem::size_of;
+        use std::ptr::{null_mut, write};
+        use windows_sys::Win32::Graphics::Printing::PRINTER_INFO_4W;
+
+        let data_bytes = size_of::<PRINTER_INFO_4W>() + size_of::<u16>();
+        let mut buffer = vec![0u64; data_bytes.div_ceil(size_of::<u64>())];
+        let base = buffer.as_mut_ptr().cast::<u8>();
+        let name_pointer = unsafe { base.add(size_of::<PRINTER_INFO_4W>()).cast::<u16>() };
+        unsafe {
+            name_pointer.write(b'A' as u16);
+            write(
+                base.cast::<PRINTER_INFO_4W>(),
+                PRINTER_INFO_4W {
+                    pPrinterName: name_pointer,
+                    pServerName: null_mut(),
+                    Attributes: 0,
+                },
+            );
+        }
+
+        assert!(parse_printer_info_4(&buffer, data_bytes, 1).is_err());
     }
 
     #[test]

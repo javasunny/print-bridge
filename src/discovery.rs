@@ -8,10 +8,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const SERVICE_TYPE: &str = "_universal._sub._ipp._tcp.local.";
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 fn machine_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
@@ -108,6 +110,8 @@ pub(crate) struct Discovery {
     names: Vec<String>,
     error: Arc<Mutex<Option<String>>>,
     announced: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    monitor: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Discovery {
@@ -116,38 +120,83 @@ impl Discovery {
         address: SocketAddr,
         auth: bool,
     ) -> Result<Self, String> {
-        let mut discovery = Self {
+        let discovery = Self {
             daemon: None,
             names: Vec::new(),
             error: Arc::new(Mutex::new(None)),
             announced: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            monitor: None,
         };
         if address.ip().is_loopback() || !printers.iter().any(|p| p.enabled) {
             return Ok(discovery);
         }
-        let daemon = ServiceDaemon::new().map_err(|e| e.to_string())?;
+        let services = printers
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|printer| service_info(printer, address, auth))
+            .collect::<Result<Vec<_>, _>>()?;
+        discovery.register_services(
+            ServiceDaemon::new().map_err(|e| e.to_string())?,
+            services,
+            ANNOUNCE_INTERVAL,
+        )
+    }
+
+    fn register_services(
+        mut self,
+        daemon: ServiceDaemon,
+        services: Vec<ServiceInfo>,
+        interval: Duration,
+    ) -> Result<Self, String> {
+        self.daemon = Some(daemon.clone());
         let events = daemon.monitor().map_err(|e| e.to_string())?;
-        discovery.daemon = Some(daemon.clone());
-        for printer in printers.iter().filter(|p| p.enabled) {
-            let info = service_info(printer, address, auth)?;
-            let name = info.get_fullname().to_owned();
-            daemon.register(info).map_err(|e| e.to_string())?;
-            discovery.names.push(name);
+        for info in &services {
+            daemon.register(info.clone()).map_err(|e| e.to_string())?;
+            self.names.push(info.get_fullname().to_owned());
         }
-        let error = Arc::clone(&discovery.error);
-        let announced = Arc::clone(&discovery.announced);
-        std::thread::spawn(move || {
-            while let Ok(event) = events.recv() {
-                match event {
-                    DaemonEvent::Error(message) => {
-                        *error.lock().unwrap() = Some(message.to_string())
+        let error = Arc::clone(&self.error);
+        let announced = Arc::clone(&self.announced);
+        let stopped = Arc::clone(&self.stopped);
+        self.monitor = Some(std::thread::spawn(move || {
+            let mut next_announce = Instant::now() + interval;
+            while !stopped.load(Ordering::SeqCst) {
+                // Use a deadline so query traffic cannot postpone the refresh.
+                let now = Instant::now();
+                if now >= next_announce {
+                    for info in &services {
+                        // Re-register in place: no goodbye or gap in discovery.
+                        // Keep the original auto-address template to avoid stale IPs.
+                        if let Err(message) = daemon.register(info.clone()) {
+                            *error.lock().unwrap() = Some(message.to_string());
+                            announced.store(false, Ordering::SeqCst);
+                        }
                     }
-                    DaemonEvent::Announce(..) => announced.store(true, Ordering::SeqCst),
-                    _ => (),
+                    next_announce = now + interval;
+                }
+                let wait = next_announce
+                    .saturating_duration_since(Instant::now())
+                    .min(MONITOR_POLL_INTERVAL);
+                match events.recv_timeout(wait) {
+                    Ok(DaemonEvent::Error(message)) => {
+                        *error.lock().unwrap() = Some(message.to_string());
+                        announced.store(false, Ordering::SeqCst);
+                    }
+                    Ok(DaemonEvent::Announce(..)) => {
+                        *error.lock().unwrap() = None;
+                        announced.store(true, Ordering::SeqCst);
+                    }
+                    Ok(_) => (),
+                    Err(_) if events.is_disconnected() => {
+                        *error.lock().unwrap() = Some("自动发现广播线程已停止".into());
+                        announced.store(false, Ordering::SeqCst);
+                        break;
+                    }
+                    Err(_) => (),
                 }
             }
-        });
-        Ok(discovery)
+        }));
+        Ok(self)
     }
 
     pub(crate) fn active(&self) -> bool {
@@ -161,6 +210,10 @@ impl Discovery {
 
 impl Drop for Discovery {
     fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(monitor) = self.monitor.take() {
+            let _ = monitor.join();
+        }
         if let Some(daemon) = self.daemon.take() {
             for name in &self.names {
                 if let Ok(done) = daemon.unregister(name) {
@@ -215,6 +268,8 @@ mod tests {
         assert_eq!(info.get_addresses().len(), 1);
         assert!(!info.is_addr_auto());
         assert_eq!(info.get_port(), 8631);
+        assert!(ANNOUNCE_INTERVAL.as_secs() < u64::from(info.get_host_ttl()));
+        assert!(ANNOUNCE_INTERVAL.as_secs() < u64::from(info.get_other_ttl()));
         assert!(info.get_fullname().len() <= 80);
     }
 
@@ -255,6 +310,8 @@ mod tests {
             daemon: Some(daemon.clone()),
             error: Arc::new(Mutex::new(None)),
             announced: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            monitor: None,
         };
         daemon.register(info).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -303,6 +360,71 @@ mod tests {
             .unwrap();
         assert_eq!(metrics.get("register"), Some(&1));
         assert!(metrics.get("respond").copied().unwrap_or(0) >= 2);
+    }
+
+    #[test]
+    fn refreshes_all_queues_without_queries_and_stops_before_withdrawing() {
+        use std::collections::HashSet;
+        use std::net::UdpSocket;
+
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let daemon = ServiceDaemon::new_with_port(port).unwrap();
+        let events = daemon.monitor().unwrap();
+        let mut second = printer();
+        second.id = "warehouse".into();
+        let services: Vec<_> = [printer(), second]
+            .iter()
+            .map(|p| {
+                let mut info = service_info(p, "127.0.0.1:8631".parse().unwrap(), false).unwrap();
+                info.set_interfaces(vec![IfKind::LoopbackV4]);
+                info
+            })
+            .collect();
+        let names: HashSet<_> = services
+            .iter()
+            .map(|info| info.get_fullname().to_owned())
+            .collect();
+        let discovery = Discovery::start(&[], "127.0.0.1:8631".parse().unwrap(), false)
+            .unwrap()
+            .register_services(daemon.clone(), services, Duration::from_secs(2))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut announcements = HashMap::new();
+        let mut refreshed = HashSet::new();
+        while refreshed != names {
+            assert!(Instant::now() < deadline, "missing periodic announcements");
+            if let Ok(DaemonEvent::Announce(name, _)) =
+                events.recv_timeout(Duration::from_millis(100))
+            {
+                let count = announcements.entry(name.clone()).or_insert(0);
+                *count += 1;
+                // Initial registration sends two announcements. A third must
+                // come from the refresh worker, with no client queries.
+                if *count >= 3 {
+                    refreshed.insert(name);
+                }
+            }
+        }
+        assert!(discovery.active());
+        let metrics = daemon
+            .get_metrics()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(metrics.get("register").copied().unwrap_or(0) >= 4);
+        assert_eq!(metrics.get("unregister").copied().unwrap_or(0), 0);
+        assert_eq!(metrics.get("respond").copied().unwrap_or(0), 0);
+        let worker = Arc::downgrade(&discovery.stopped);
+        drop(discovery);
+        assert!(
+            worker.upgrade().is_none(),
+            "refresh worker outlived discovery"
+        );
+        assert!(daemon.get_metrics().is_err(), "daemon was not shut down");
     }
 
     #[test]

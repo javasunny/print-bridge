@@ -1,0 +1,86 @@
+name: Release Windows x64
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+      # Keep checked-in text identical on Windows for documentation/license checks.
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Prepare release notes and validate version
+        run: node scripts/release.mjs prepare "$RUNNER_TEMP/release-notes.md"
+
+      - name: Install Rust and Tauri CLI
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          cargo install tauri-cli --version 2.12.4 --locked
+
+      - name: Tests and formatting
+        run: |
+          set -euo pipefail
+          cargo fmt --check
+          cargo fmt --manifest-path desktop/Cargo.toml --check
+          cargo test --locked
+          node --check desktop/ui/app.js
+          node --test desktop/ui/*.test.mjs scripts/*.test.mjs
+
+      - name: Check third-party licenses
+        run: |
+          set -euo pipefail
+          cargo fetch --manifest-path desktop/Cargo.toml --locked
+          node scripts/generate-third-party-notices.mjs --check
+
+      - name: Build Windows installer and executable
+        working-directory: desktop
+        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis -- --locked
+
+      - name: Collect release files and checksums
+        run: node scripts/release.mjs package
+
+      - name: Create draft, verify downloads, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --draft \
+            --title "Print Bridge $GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${args[@]}"
+          gh release download "$GITHUB_REF_NAME" --dir "$RUNNER_TEMP/release-download"
+          node scripts/release.mjs verify "$RUNNER_TEMP/release-download"
+          test "$(git rev-parse HEAD)" = "$(gh api "repos/$GH_REPO/commits/$GITHUB_REF_NAME" --jq .sha)"
+          gh release edit "$GITHUB_REF_NAME" --draft=false

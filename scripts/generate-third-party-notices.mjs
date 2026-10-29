@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -33,7 +33,9 @@ for (const pkg of metadata.packages.filter((pkg) => pkg.source).sort((a, b) => `
     const content = readFileSync(file, 'utf8').replace(/\r\n/g, '\n').trim();
     const digest = createHash('sha256').update(content).digest('hex');
     if (!texts.has(digest)) texts.set(digest, { id: texts.size + 1, content });
-    const source = file.startsWith(overrides) ? sources[relative(overrides, file)] : relative(directory, file);
+    const source = file.startsWith(overrides)
+      ? sources[relative(overrides, file).split(sep).join('/')]
+      : relative(directory, file).split(sep).join('/');
     return `  License text ${texts.get(digest).id}: ${source}`;
   });
   catalog.push([

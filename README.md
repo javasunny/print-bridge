@@ -126,7 +126,7 @@ Node.js 用于前端测试，Rust 测试不执行真实打印：
 ```sh
 cargo test --locked
 cargo fmt --check
-node --test desktop/ui/*.test.mjs
+node --test desktop/ui/*.test.mjs scripts/*.test.mjs
 node --check desktop/ui/app.js
 cargo fmt --manifest-path desktop/Cargo.toml --check
 cargo check --manifest-path desktop/Cargo.toml --locked

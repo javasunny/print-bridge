@@ -44,6 +44,26 @@ bash scripts/build-windows.sh
 
 ## 创建 Release
 
+### GitHub Actions 自动发布
+
+仓库中的 `.github/workflows/release.yml` 在推送 `v*` 标签后自动执行 Windows x64 发布。普通代码推送不会触发发布；无需额外配置个人 Token，工作流使用 GitHub 提供的 `GITHUB_TOKEN` 和 `contents: write` 权限。
+
+完成上述版本准备、相关测试及实机验收记录后，推送包含工作流的源码，再推送与应用版本完全一致的新标签。例如应用版本为 `0.2.2` 时：
+
+```sh
+git push origin HEAD
+git tag v0.2.2
+git push origin v0.2.2
+```
+
+工作流会核对标签、应用版本、Cargo 清单及对应更新日志，执行 Rust/前端/发布脚本测试、格式和依赖许可检查，使用 Windows 原生工具链构建 NSIS 安装包及独立 EXE，并收集上表中的全部文件。Release 说明从对应版本的更新日志生成，并附带安装方式和验证边界。
+
+文件先上传到 Release 草稿，随后下载全部资产，核对文件清单和 SHA-256，通过后才公开发布。正式版本默认按正式版本发布；`-beta.N`、`-rc.N` 标签标记为 pre-release。已有同名 Release 不会覆盖；若上传或下载验证失败，会保留草稿供排查，修复后可删除尚未发布的草稿并在 Actions 页面重新运行。已经公开发布的程序变化必须使用新版本号。
+
+在 GitHub 仓库的 Actions 页面查看执行进度。自动化构建不执行实体打印或 Apple 设备联机验收，相关结果仍应记录到 Windows 验证清单。
+
+### 手动发布
+
 推送已验证的源码 commit 后，用 `v<version>` 标签发布。Release 说明至少包含安装方式、首次下载打印组件、运行平台、主要变化、未签名提示及实际验证边界。默认按正式版本发布，不因版本处于 `0.x` 或存在已披露的验收限制而自动标记预发布。仅在用户明确要求试用版、测试版，或本次交付明确属于兼容性试验版本时，使用 `-beta`、`-rc` 等预发布版本号，并在 GitHub 标记为 pre-release。正式发布同样需要如实说明验证范围，不把未验收的设备或能力写成已支持。
 
 发布前核对本地文件哈希与构建输出一致；发布后从 GitHub 核对标签指向的 commit、资产文件名、大小和上传后的 SHA-256，确认安装包和独立 EXE 均可下载。GitHub 自动提供源码 ZIP / tar.gz，不需要把本地缓存上传到 Release。

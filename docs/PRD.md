@@ -42,7 +42,7 @@ Bonjour 发布（src/discovery.rs）→ Apple 设备发现每个启用队列
 
 每台启用打印机提供 `/ipp/printers/{id}`，并发布 `_ipp._tcp.local.` 与 AirPrint `_universal._sub._ipp._tcp.local.`。TXT 反映队列、端口、认证、格式和已配置能力。回环监听不发布局域网打印机。
 
-停用队列或停止服务会撤销广播，修改配置会更新广播。发现失败会显示错误，但不阻断手动 IPP 打印。应用不自动修改 Windows 防火墙，需在私有局域网放行服务 TCP 端口和 UDP 5353，排障见 [AirPrint 说明](airprint.md)。
+运行期间每 60 秒重新公告全部共享队列；停用队列或停止服务会结束旧刷新线程并撤销广播，修改配置会更新广播。发现失败会显示错误，但不阻断手动 IPP 打印。应用不自动修改 Windows 防火墙，需在私有局域网放行服务 TCP 端口和 UDP 5353，排障见 [AirPrint 说明](airprint.md)。
 
 ## 5. 设备认证
 
